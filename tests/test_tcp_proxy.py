@@ -63,7 +63,12 @@ class FakeWriter:
     _port = 50000
 
     def __init__(
-        self, *, drain_hangs: bool = False, close_error: Exception | None = None, close_hangs: bool = False
+        self,
+        *,
+        drain_hangs: bool = False,
+        drain_error: Exception | None = None,
+        close_error: Exception | None = None,
+        close_hangs: bool = False,
     ) -> None:
         FakeWriter._port += 1
         self.port = FakeWriter._port
@@ -71,6 +76,7 @@ class FakeWriter:
         self.closing = False
         self.aborted = False
         self.drain_hangs = drain_hangs
+        self.drain_error = drain_error
         self.close_error = close_error
         self.close_hangs = close_hangs
         self.transport = FakeTransport(self)
@@ -79,6 +85,8 @@ class FakeWriter:
         self.data += data
 
     async def drain(self) -> None:
+        if self.drain_error is not None:
+            raise self.drain_error
         if self.drain_hangs:
             await asyncio.Event().wait()
 
@@ -151,3 +159,45 @@ async def test_disconnect_is_never_forwarded(proxy: server.MeshtasticTcpProxy, v
     assert not other_writer.closing
     other_reader.feed_eof()
     await other
+
+
+def node_info(num: int) -> mesh_pb2.FromRadio:
+    return mesh_pb2.FromRadio(node_info=mesh_pb2.NodeInfo(num=num))
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        pytest.param(FakeWriter(drain_hangs=True), id="slow peer"),
+        pytest.param(FakeWriter(drain_error=ConnectionResetError()), id="dead peer write"),
+    ],
+)
+async def test_unwritable_peer_is_disconnected_alone(
+    proxy: server.MeshtasticTcpProxy, monkeypatch: pytest.MonkeyPatch, writer: FakeWriter
+) -> None:
+    monkeypatch.setattr(server, "_WRITE_TIMEOUT_S", 0.05)
+    reader, writer = client(writer)
+    healthy_reader, healthy_writer = client()
+    handler = asyncio.create_task(proxy._handle_client(reader, writer))
+    healthy = asyncio.create_task(proxy._handle_client(healthy_reader, healthy_writer))
+    await asyncio.sleep(0)
+
+    proxy._interface.packets.put_nowait(node_info(1))
+    async with asyncio.timeout(2):
+        await handler
+    assert writer.closing
+
+    proxy._interface.packets.put_nowait(node_info(2))
+    await wait_until(lambda: [p.node_info.num for p in healthy_writer.received()] == [1, 2])
+    assert not healthy.done()
+    healthy_reader.feed_eof()
+    await healthy
+
+
+async def test_dead_peer_eof_closes_handler(proxy: server.MeshtasticTcpProxy) -> None:
+    reader, writer = client()
+    handler = asyncio.create_task(proxy._handle_client(reader, writer))
+    reader.feed_eof()
+    async with asyncio.timeout(2):
+        await handler
+    assert writer.closing
