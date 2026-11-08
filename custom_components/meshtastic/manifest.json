@@ -1,6 +1,6 @@
 {
   "domain": "meshtastic",
-  "name": "Meshtastic",
+  "name": "Meshtastic (kernel-oops fork)",
   "after_dependencies": [
     "bluetooth",
     "bluetooth_adapters",
