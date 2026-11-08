@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2024-2025 Pascal Brogle @broglep
 # SPDX-FileCopyrightText: 2025 Hendrik @novag
-# SPDX-FileCopyrightText: 2026 Marc Warne @kernel-oops
+# SPDX-FileCopyrightText: 2026 Marc Warne <marc@kernel-panic.im>
 #
 # SPDX-License-Identifier: MIT
 
