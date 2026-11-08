@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: MIT
 
 import asyncio
+import logging
 from asyncio import StreamReader, StreamWriter
 from types import TracebackType
 from typing import Self
@@ -14,9 +15,8 @@ from custom_components.meshtastic.aiomeshtastic import MeshInterface
 from custom_components.meshtastic.aiomeshtastic.connection import ClientApiConnection
 from custom_components.meshtastic.aiomeshtastic.connection.streaming import StreamingClientTransport
 from custom_components.meshtastic.aiomeshtastic.protobuf import mesh_pb2
-from custom_components.meshtastic.const import LOGGER
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 # a client that cannot take a frame within this time is not reading and gets disconnected
 _WRITE_TIMEOUT_S = 30.0
