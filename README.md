@@ -19,7 +19,7 @@ its own branch, intended to be offered upstream for review.
 
 ## What this fork fixes
 
-All of these concern the TCP proxy that lets other Meshtastic clients share the
+Most of these concern the TCP proxy that lets other Meshtastic clients share the
 integration's connection to the radio, and the channel list the integration keeps.
 
 * **Any proxy client could disconnect Home Assistant from the radio.** A client's
@@ -38,6 +38,14 @@ integration's connection to the radio, and the channel list the integration keep
   reports each client's real connection state, logs which client was dropped and why,
   stops cleanly, and if its forwarder fails it stops listening and disconnects its
   clients instead of accepting connections that would never receive anything.
+
+* **`model_id` was passed to the device registry as an int.** A node whose hardware
+  model is newer than the bundled protobuf reports it as a number, which Home Assistant
+  warns will stop working in 2026.12.0. It is now passed as a string. This fix is also
+  offered upstream.
+* **Doubled logger names.** Some modules logged as
+  `custom_components.meshtastic.custom_components.meshtastic.…`. They now log under their
+  own module name, still beneath `custom_components.meshtastic`.
 
 A client dropped for falling behind usually reconnects and asks for the radio's full
 configuration again, which restarts the shared session and re-sends it to Home Assistant
