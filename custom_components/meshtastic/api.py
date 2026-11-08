@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from copy import deepcopy
 from datetime import timedelta
 from enum import StrEnum
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
     from .aiomeshtastic.interface import MeshNode, TelemetryType
     from .aiomeshtastic.packet import Packet
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 
 EVENT_MESHTASTIC_API_BASE = f"{DOMAIN}_api"

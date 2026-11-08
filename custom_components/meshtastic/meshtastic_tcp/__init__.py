@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: MIT
 
+import logging
+
 from homeassistant.core import HomeAssistant
 
 from ..const import (  # noqa: TID252
@@ -10,12 +12,11 @@ from ..const import (  # noqa: TID252
     CONF_OPTION_TCP_PROXY_ENABLE_DEFAULT,
     CONF_OPTION_TCP_PROXY_PORT,
     CONF_OPTION_TCP_PROXY_PORT_DEFAULT,
-    LOGGER,
 )
 from ..data import MeshtasticConfigEntry  # noqa: TID252
 from .server import MeshtasticTcpProxy
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 _servers: dict[str, MeshtasticTcpProxy] = {}
 

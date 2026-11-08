@@ -5,6 +5,7 @@
 import asyncio
 import contextlib
 import datetime
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -25,14 +26,13 @@ from ..const import (  # noqa: TID252
     CONF_OPTION_WEB_CLIENT_ENABLE,
     CONF_OPTION_WEB_CLIENT_ENABLE_DEFAULT,
     DOMAIN,
-    LOGGER,
     URL_BASE,
 )
 
 if TYPE_CHECKING:
     from ..data import MeshtasticConfigEntry  # noqa: TID252
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 
 class MeshtasticWebApiContext:
