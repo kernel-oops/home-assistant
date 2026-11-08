@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 from copy import deepcopy
 from typing import TYPE_CHECKING
@@ -47,7 +48,6 @@ from .const import (
     CONF_OPTION_WEB_CLIENT_ENABLE_DEFAULT,
     CURRENT_CONFIG_VERSION_MAJOR,
     DOMAIN,
-    LOGGER,
     ConfigOptionNotifyPlatformNodes,
     ConnectionType,
 )
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.data_entry_flow import FlowResult
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _step_user_data_connection_tcp_schema_factory(host: str = "", port: int | None = None) -> vol.Schema:
