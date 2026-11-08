@@ -1,11 +1,88 @@
 <!--
 SPDX-FileCopyrightText: 2024-2025 Pascal Brogle @broglep
 SPDX-FileCopyrightText: 2025 Ylian Saint-Hilaire @ylianst
+SPDX-FileCopyrightText: 2026 Marc Warne @kernel-oops
 
 SPDX-License-Identifier: MIT
 -->
 
-# Home-Assistant Meshtastic Integration
+# Home-Assistant Meshtastic Integration (kernel-oops fork)
+
+This is a fork of [meshtastic/home-assistant](https://github.com/meshtastic/home-assistant),
+the Meshtastic integration written by Pascal Brogle ([@broglep](https://github.com/broglep))
+and its contributors. It is based on upstream 0.6.1 and adds the fixes listed below.
+Apart from this introduction and the HACS installation steps, this README is upstream's own.
+
+The integration keeps the domain `meshtastic`, so it replaces the upstream integration in
+place: existing config entries, devices and entities carry over. Each fix has been offered
+upstream as a pull request.
+
+## What this fork fixes
+
+All of these concern the TCP proxy that lets other Meshtastic clients share the
+integration's connection to the radio, and the channel list the integration keeps.
+
+* **Any proxy client could disconnect Home Assistant from the radio.** A client's
+  `disconnect` message was only intercepted when its value was true, so one sent with
+  value false reached the radio, which closes the shared session whatever the value.
+  The proxy now intercepts every `disconnect` and closes only the client that sent it.
+* **Channels accumulated.** Every time a proxy client asked the radio for its
+  configuration, the integration appended another full set of channels. Channels are
+  now replaced by index.
+* **Channel index off by one.** A channel index equal to the number of channels was
+  accepted and raised an error, instead of reporting the channel as unavailable.
+* **Proxy clients are isolated from each other, and the transport is bounded.** Each
+  client has a bounded queue and a 30 second write deadline, and a client that falls
+  behind is disconnected on its own instead of growing memory or holding up the others.
+  Closing a client is bounded and falls back to aborting the connection. The proxy
+  reports each client's real connection state, logs which client was dropped and why,
+  stops cleanly, and if its forwarder fails it stops listening and disconnects its
+  clients instead of accepting connections that would never receive anything.
+
+A client dropped for falling behind usually reconnects and asks for the radio's full
+configuration again, which restarts the shared session and re-sends it to Home Assistant
+and every other client.
+
+## Installation
+
+### Recommended: [HACS](https://www.hacs.xyz), as a custom repository
+
+This fork is not in the HACS default list, so add it as a custom repository.
+
+1. Take a backup of Home Assistant.
+2. If you installed upstream Meshtastic through HACS, remove that download in HACS first:
+   both provide the `meshtastic` domain, and the HACS Marketplace refuses to install a
+   second repository with the same domain. Do not delete the Meshtastic integration under
+   **Settings** > **Devices & services**; that would delete its config entries.
+3. Add this repository to HACS:
+   [![Add Repository](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=kernel-oops&repository=home-assistant&category=integration)
+   or, in HACS, open the three-dot menu, choose **Custom repositories**, enter
+   `https://github.com/kernel-oops/home-assistant`, select the type **Integration** and
+   click **Add**. From Home Assistant 2026.11, HACS is **Settings** > **Marketplace**; the
+   link above opens it there.
+4. Download **Meshtastic (kernel-oops fork)** and restart Home Assistant.
+5. If this is a new installation, set up the integration using the UI:
+   [![Add Integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=meshtastic)
+
+### Alternatives
+<details>
+<summary>Alternatives</summary>
+
+### Manual
+1. Using the tool of choice open the directory (folder) for your HA configuration (where you find `configuration.yaml`).
+2. If you do not have a `custom_components` directory (folder) there, you need to create it.
+3. In the `custom_components` directory (folder) create a new folder called `homeassistant-meshtastic`.
+4. Download _all_ the files from the `custom_components/meshtastic/` directory (folder) in this repository.
+5. Place the files you downloaded in the new directory (folder) you created.
+6. Restart Home Assistant
+7. In the HA UI go to "Configuration" -> "Integrations" click "+" and search for "Meshtastic"
+</details>
+
+### Configuration is done in the UI
+
+<!---->
+
+# Upstream documentation
 
 [![GitHub Release][releases-shield]][releases]
 [![License][license-shield]](LICENSE)
@@ -31,33 +108,6 @@ Supported Features:
  * MQTT client proxy support (forwards messages from radio to MQTT broker)
 
 For more details, see check the [documentation](#documentation).
-
-## Installation
-
-### Recommended: [HACS](https://www.hacs.xyz)
-
-1. Add this repository as a custom repository to HACS: [![Add Repository](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=meshtastic&repository=home-assistant&category=integration)
-2. Use HACS to install the integration.
-3. Restart Home Assistant.
-4. Set up the integration using the UI: [![Add Integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=meshtastic)
-
-### Alternatives
-<details>
-<summary>Alternatives</summary>
-
-### Manual
-1. Using the tool of choice open the directory (folder) for your HA configuration (where you find `configuration.yaml`).
-2. If you do not have a `custom_components` directory (folder) there, you need to create it.
-3. In the `custom_components` directory (folder) create a new folder called `homeassistant-meshtastic`.
-4. Download _all_ the files from the `custom_components/meshtastic/` directory (folder) in this repository.
-5. Place the files you downloaded in the new directory (folder) you created.
-6. Restart Home Assistant
-7. In the HA UI go to "Configuration" -> "Integrations" click "+" and search for "Meshtastic"
-</details>
-
-### Configuration is done in the UI
-
-<!---->
 
 # Documentation
 
@@ -314,6 +364,6 @@ If you want to contribute to this please read the [Contribution guidelines](CONT
 [commits-shield]: https://img.shields.io/github/commit-activity/y/meshtastic/home-assistant.svg?style=for-the-badge
 [commits]: https://github.com/meshtastic/home-assistant/commits/main
 [license-shield]: https://img.shields.io/github/license/meshtastic/home-assistant.svg?style=for-the-badge
-[releases-shield]: https://img.shields.io/github/release/meshtastic/home-assistant.svg?style=for-the-badge
-[releases]: https://github.com/meshtastic/home-assistant/releases
+[releases-shield]: https://img.shields.io/github/release/kernel-oops/home-assistant.svg?style=for-the-badge
+[releases]: https://github.com/kernel-oops/home-assistant/releases
 
