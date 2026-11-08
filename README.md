@@ -14,8 +14,8 @@ and its contributors. It is based on upstream 0.6.1 and adds the fixes listed be
 Apart from this introduction and the HACS installation steps, this README is upstream's own.
 
 The integration keeps the domain `meshtastic`, so it replaces the upstream integration in
-place: existing config entries, devices and entities carry over. Each fix has been offered
-upstream as a pull request.
+place: existing config entries, devices and entities carry over. Each fix is also kept on
+its own branch, intended to be offered upstream for review.
 
 ## What this fork fixes
 
