@@ -161,7 +161,7 @@ class BluetoothConnection(ClientApiConnection):
 
         return continue_active_read, notify_timeout_count
 
-    async def _packet_stream(self) -> AsyncGenerator[mesh_pb2.FromRadio, Any]:
+    async def _packet_stream(self) -> AsyncGenerator[mesh_pb2.FromRadio, Any]:  # noqa: PLR0915
         if not self.is_connected:
             return
         packet_num_queue: asyncio.Queue[int] = asyncio.Queue()
@@ -233,6 +233,7 @@ class BluetoothConnection(ClientApiConnection):
                     yield from_radio
                 except message.DecodeError:
                     self._logger.warning("Error while parsing FromRadio bytes %s", packet, exc_info=True)
+                    self.replay_cache.frame_lost()
         except bleak.BleakError as e:
             raise BluetoothConnectionError from e
         finally:

@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import time
 from abc import abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ from google.protobuf.message import Message
 from ..packet import Packet  # noqa: TID252
 from ..protobuf import mesh_pb2, portnums_pb2  # noqa: TID252
 from ..redact import without_secrets  # noqa: TID252
+from ..replay import ReplayCache  # noqa: TID252
 from .errors import (
     ClientApiConnectFailedError,
     ClientApiConnectionError,
@@ -30,6 +32,11 @@ from .errors import (
 from .listener import ClientApiConnectionPacketStreamListener
 
 LOGGER = logging.getLogger(__package__)
+
+# waits before each download of the replay snapshot while it is missing: the first is quiet time after a setting
+# write, so a burst of writes costs one download; the rest back off after a download that could not be kept
+_REPLAY_REFRESH_DELAYS_S = (5.0, 30.0, 120.0, 600.0)
+_REPLAY_DOWNLOAD_TIMEOUT_S = 60.0
 
 
 class _LazyProtobufLog:
@@ -63,6 +70,15 @@ class ClientApiConnection:
         self._pending_config_requests: dict[int, asyncio.Event] = {}
         # told of every write to the radio, Home Assistant's own and other clients'
         self.on_write: Callable[[mesh_pb2.ToRadio], None] | None = None
+        # want_config_id of this session's latest config request, which its completion must match
+        self.requested_config_id: int | None = None
+        # this session's raw bootstrap and recent texts for TCP proxy clients. Fed here, before any listener: a
+        # reconnect's bootstrap is read by request_config() alone, before the interface listens again
+        self.replay_cache = ReplayCache()
+        self.replay_cache.on_failure = self._replay_failed
+        self._replay_refresh: asyncio.Task | None = None
+        # when a config request this connection does not wait on itself (the web client's) was sent
+        self._watched_request_at = float("-inf")
         self._processing_packets_consumer_count = 0
         self._processing_packets_consumer_lock = asyncio.Lock()
         self._on_demand_streaming_processing_lock = asyncio.Lock()
@@ -86,6 +102,7 @@ class ClientApiConnection:
             raise ClientApiConnectFailedError from e
 
     async def disconnect(self) -> None:
+        self.cancel_replay_refresh()
         for listener in self._packet_stream_listeners:
             listener.close()
 
@@ -176,6 +193,10 @@ class ClientApiConnection:
 
         try:
             async for packet in self._packet_stream():
+                try:
+                    self.replay_cache.ingest(packet, self.requested_config_id)
+                except Exception:
+                    self._logger.warning("Replay cache failed to take packet", exc_info=True)
                 await self._update_queue_status(packet)
                 await self._notify_packet_stream_listeners(packet)
                 # give listener higher change to process packet before continuing ourselves
@@ -249,6 +270,7 @@ class ClientApiConnection:
             if start_config_packet.want_config_id == self._CONFIG_ID_MINIMAL:
                 start_config_packet.want_config_id += 1
 
+        self.config_requested(start_config_packet.want_config_id)
         async for packet in self.listen(on_start=self.send_packet(start_config_packet)):
             if on_packet is not None:
                 try:
@@ -399,17 +421,36 @@ class ClientApiConnection:
         return self._current_packet_id
 
     async def send_packet(self, to_radio: mesh_pb2.ToRadio) -> bool:
+        # before and after: a bootstrap completed while this waits for the radio's queue predates the write
+        self.note_write(to_radio)
         try:
             return await self._send_queued(to_radio)
         finally:
+            self.note_write(to_radio)
             self._note_write(to_radio)
 
     async def forward(self, packet: bytes, to_radio: mesh_pb2.ToRadio) -> bool:
         """Send another client's ToRadio (the web client's or a proxy client's) to the radio as received."""
+        self.note_write(to_radio)
         try:
             return await self._send_packet(packet)
         finally:
+            self.note_write(to_radio)
             self._note_write(to_radio)
+
+    def note_write(self, to_radio: mesh_pb2.ToRadio) -> None:
+        """
+        Mark the replay snapshot stale for a write that changes the gateway, and download a fresh one once writes stop.
+
+        Without the refresh, proxy clients would be refused until the next reconnect, which may be days away.
+        Called before and after every send: the first drops a download in flight, the second one that completed
+        while the send waited.
+        """
+        if self.replay_cache.note_write(to_radio):
+            # a download in flight, the web client's included, predates this write and no longer counts
+            self._watched_request_at = float("-inf")
+            self.cancel_replay_refresh()
+            self._replay_refresh = asyncio.create_task(self._refresh_replay(), name="replay-refresh")
 
     def _note_write(self, to_radio: mesh_pb2.ToRadio) -> None:
         if self.on_write is not None:
@@ -417,6 +458,62 @@ class ClientApiConnection:
                 self.on_write(to_radio)
             except Exception:
                 self._logger.warning("Watching a write to the radio failed", exc_info=True)
+
+    def _replay_failed(self) -> None:
+        self._watched_request_at = float("-inf")  # that download is over, so no need to wait for it
+        # a refresh already running retries on its own
+        if self._replay_refresh is None or self._replay_refresh.done():
+            self._replay_refresh = asyncio.create_task(self._refresh_replay(), name="replay-refresh")
+
+    def config_requested(self, want_config_id: int, *, watch: bool = False) -> None:
+        """
+        Note a config request on this session: its completion is the next snapshot, and no refresh competes.
+
+        With watch, for a request this connection does not wait on itself (the web client's), a download that
+        never completes is replaced once it has had as long as one of our own would.
+        """
+        self.requested_config_id = want_config_id
+        self.cancel_replay_refresh()
+        if watch:
+            self._watched_request_at = time.monotonic()
+            self._replay_refresh = asyncio.create_task(self._refresh_replay(), name="replay-refresh")
+
+    def cancel_replay_refresh(self) -> None:
+        # the refresh's own request_config() calls this too, and must not cancel itself
+        if self._replay_refresh is not None and self._replay_refresh is not asyncio.current_task():
+            self._replay_refresh.cancel()
+            self._replay_refresh = None
+
+    async def _refresh_replay(self) -> None:
+        for delay in _REPLAY_REFRESH_DELAYS_S:
+            await asyncio.sleep(delay)
+            if self.replay_cache.ready.is_set() or not self.is_connected:
+                return
+            if self.requested_config_id in {None, self._CONFIG_ID_MINIMAL}:
+                return  # stopped (a write finishing late may schedule this), or a minimal session that is never kept
+            # someone else's download (the web client's), requested or arriving, gets as long as one of ours would;
+            # a new request now would make the radio abandon it
+            if self.replay_cache.bootstrapping:
+                age = self.replay_cache.bootstrap_age
+            else:
+                age = time.monotonic() - self._watched_request_at
+            if age < _REPLAY_DOWNLOAD_TIMEOUT_S:
+                continue
+            self.replay_cache.discard(f"no complete download within {_REPLAY_DOWNLOAD_TIMEOUT_S:g} s")
+            self._logger.debug("Downloading the configuration again for proxy clients")
+            try:
+                await asyncio.wait_for(self.request_config(), timeout=_REPLAY_DOWNLOAD_TIMEOUT_S)
+            except Exception:
+                self._logger.debug("Configuration download for proxy clients failed", exc_info=True)
+                # still running, so no newer download has started: what has arrived is this one's
+                self.replay_cache.discard(f"no complete download within {_REPLAY_DOWNLOAD_TIMEOUT_S:g} s")
+            if self.replay_cache.ready.is_set():
+                return
+        self._logger.warning(
+            "TCP proxy clients cannot connect until Home Assistant next reconnects to the gateway: its configuration "
+            "could not be read (%s). The proxy needs firmware 2.5 or later",
+            self.replay_cache.failure or "no complete download",
+        )
 
     async def _send_queued(self, to_radio: mesh_pb2.ToRadio) -> bool:
         packet: bytes = to_radio.SerializeToString()
@@ -514,6 +611,7 @@ class ClientApiConnection:
         If reconnect is already in progress, waits until pending reconnect is completed.
         Returns true if new reconnect has been performed
         """
+        self.cancel_replay_refresh()  # a reconnect downloads the configuration itself
         async with self._reconnect_status_lock:
             reconnect_was_in_progress = self._reconnect_in_progress.is_set()
 

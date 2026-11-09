@@ -450,6 +450,8 @@ class MeshtasticWebApiV1ToRadioView(MeshtasticWebApiV1View):
             config_id = str(to_radio.want_config_id)
             self._context.add_session(request, config_id)
             response.set_cookie(SESSION_COOKIE, config_id, path=f"{URL_BASE}/web/{config_entry_id}/{token}")
+            # this restarts the gateway's session, so its bootstrap is the one proxy clients get next
+            connection.config_requested(to_radio.want_config_id, watch=True)
 
         await connection.forward(body, to_radio)
         self._add_protobuf_headers(response)
