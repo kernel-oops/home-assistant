@@ -17,6 +17,7 @@ import pytest
 from custom_components.meshtastic import meshtastic_web
 from custom_components.meshtastic.aiomeshtastic import MeshInterface, replay
 from custom_components.meshtastic.aiomeshtastic import connection as aio_connection
+from custom_components.meshtastic.aiomeshtastic import interface as aio_interface
 from custom_components.meshtastic.aiomeshtastic.connection import (
     ClientApiConnection,
     ClientApiConnectionInterruptedError,
@@ -25,6 +26,7 @@ from custom_components.meshtastic.aiomeshtastic.connection.streaming import Stre
 from custom_components.meshtastic.aiomeshtastic.protobuf import (
     admin_pb2,
     config_pb2,
+    connection_status_pb2,
     mesh_pb2,
     portnums_pb2,
     xmodem_pb2,
@@ -51,6 +53,9 @@ class FakeRadio(ClientApiConnection):
         self.sent: list[mesh_pb2.ToRadio] = []
         self.raw: list[bytes] = []  # what reached the radio, byte for byte
         self.emitted: list[bytes] = []  # what the radio sent besides its bootstraps
+        self.silent = False  # takes everything and answers nothing, as a radio that has restarted
+        self.down = False  # refuses connections, as a radio that has shut down
+        self.connects = 0
         self.incoming: asyncio.Queue[mesh_pb2.FromRadio] = asyncio.Queue()
         self.answer = answer
         self.channel_name = "LongFast"
@@ -59,7 +64,11 @@ class FakeRadio(ClientApiConnection):
         self.cut_short = 0  # how many of the next bootstraps stop after 50 records
 
     async def _connect(self) -> None:
+        if self.down:
+            raise ConnectionRefusedError
+        self.connects += 1
         self.connected = True
+        self.silent = False  # a radio that restarted answers a new connection
 
     async def _disconnect(self) -> None:
         self.connected = False
@@ -80,13 +89,35 @@ class FakeRadio(ClientApiConnection):
         to_radio = mesh_pb2.ToRadio.FromString(packet)
         self.sent.append(to_radio)
         self.raw.append(packet)
+        if self.silent:
+            return True
         if to_radio.HasField("want_config_id") and self.answer:
             self.answer_config(to_radio.want_config_id)
+        admin = replay.gateway_admin(to_radio, OWN)
+        if admin is not None and admin.HasField("get_device_connection_status_request"):
+            status = admin_pb2.AdminMessage(
+                get_device_connection_status_response=connection_status_pb2.DeviceConnectionStatus()
+            )
+            self.emit(packet_from_gateway(status, request_id=to_radio.packet.id))
         return True
 
     def emit(self, record: mesh_pb2.FromRadio) -> None:
         self.emitted.append(record.SerializeToString())
         self.incoming.put_nowait(record)
+
+    def status_requests(self) -> int:
+        return sum(
+            (admin := replay.gateway_admin(p, OWN)) is not None
+            and admin.HasField("get_device_connection_status_request")
+            for p in self.sent
+        )
+
+    def admin_sent(self, variant: str) -> list[mesh_pb2.ToRadio]:
+        return [
+            p
+            for p in self.sent
+            if (admin := replay.gateway_admin(p, OWN)) is not None and admin.WhichOneof("payload_variant") == variant
+        ]
 
     def answer_config(self, nonce: int) -> None:
         broken, self.broken = self.broken > 0, max(0, self.broken - 1)
@@ -103,6 +134,17 @@ class FakeRadio(ClientApiConnection):
 
     def disconnects(self) -> list[mesh_pb2.ToRadio]:
         return [p for p in self.sent if p.HasField("disconnect")]
+
+
+def packet_from_gateway(admin: admin_pb2.AdminMessage, request_id: int) -> mesh_pb2.FromRadio:
+    reply = mesh_pb2.MeshPacket(
+        id=request_id + 1,
+        decoded=mesh_pb2.Data(
+            portnum=portnums_pb2.PortNum.ADMIN_APP, payload=admin.SerializeToString(), request_id=request_id
+        ),
+    )
+    setattr(reply, "from", OWN)
+    return mesh_pb2.FromRadio(packet=reply)
 
 
 class FakeServer:
@@ -1331,6 +1373,301 @@ async def test_write_before_the_config_request_is_passed_on(gateway: Gateway, mo
     assert from_client(gateway, writer, len(expected_for(CLIENT_NONCE))) == []
     reader.feed_eof()
     await task
+
+
+@pytest.fixture
+def quick_restarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(aio_interface, "_RESTART_DELAY_S", 0.05)
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.05)
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_TIMEOUT_S", 0.2)
+
+
+@pytest.mark.usefixtures("quick_restarts")
+async def test_a_restart_from_a_client_is_noticed_without_waiting_for_the_heartbeat(gateway: Gateway) -> None:
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=0)))
+    await wait_until(lambda: gateway.radio.admin_sent("reboot_seconds") != [])
+    gateway.radio.silent = True  # the radio restarts; over TCP it says nothing
+    await asyncio.sleep(0.02)
+    assert not task.done()  # not closed when the command was passed on
+
+    async with asyncio.timeout(2):
+        await task  # but once the check finds the session dead, as the reconnect starts
+    await wait_until(lambda: gateway.radio.connects == 2 and gateway.cache.ready.is_set())
+    _, writer, _ = await gateway.bootstrapped(4444)  # served from the restarted radio's bootstrap
+    assert writer.frames()[: len(expected_for(4444))] == expected_for(4444)
+    assert gateway.radio.disconnects() == []
+
+
+@pytest.mark.usefixtures("quick_restarts")
+@pytest.mark.parametrize(
+    "admin",
+    [COMMIT, admin_pb2.AdminMessage(factory_reset_config=1), SET_LORA],
+    ids=["commit", "factory reset", "set_config"],
+)
+async def test_a_radio_that_answers_the_restart_check_is_left_alone(
+    gateway: Gateway, admin: admin_pb2.AdminMessage
+) -> None:
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(admin))
+    await wait_until(lambda: gateway.radio.status_requests() == 1)
+    await asyncio.sleep(0.3)
+    assert gateway.radio.status_requests() == 1
+    assert gateway.radio.connects == 1  # no reconnect
+    assert not task.done()
+    reader.feed_eof()
+    await task
+
+
+async def test_a_cancelled_restart_is_not_checked_and_a_burst_is_checked_once(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(aio_interface, "_RESTART_DELAY_S", 0.1)
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.1)
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=-1)))
+    await asyncio.sleep(0.3)
+    assert gateway.radio.status_requests() == 0
+
+    for i in range(3):  # each due 0.2 s after it
+        send(reader, admin_write(SET_LORA, packet_id=200 + i))
+        await asyncio.sleep(0.1)
+    assert gateway.radio.status_requests() == 0  # 0.3 s after the first, but not yet 0.2 s after the last
+    await wait_until(lambda: gateway.radio.status_requests() == 1)
+    await asyncio.sleep(0.3)
+    assert gateway.radio.status_requests() == 1
+    reader.feed_eof()
+    await task
+
+
+@pytest.mark.usefixtures("quick_restarts")
+async def test_a_shut_down_gateway_closes_clients_and_refuses_new_ones(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "_SNAPSHOT_WAIT_S", 0.1)
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(admin_pb2.AdminMessage(shutdown_seconds=0)))
+    await wait_until(lambda: gateway.radio.admin_sent("shutdown_seconds") != [])
+    gateway.radio.silent = gateway.radio.down = True
+    async with asyncio.timeout(2):
+        await task
+    reader, writer, refused = gateway.connect()
+    send(reader, mesh_pb2.ToRadio(want_config_id=CLIENT_NONCE))
+    async with asyncio.timeout(2):
+        await refused
+    assert writer.frames() == []
+    assert gateway.interface.is_running  # Home Assistant keeps trying to reconnect, as it always has
+
+
+@pytest.mark.usefixtures("quick_restarts")
+async def test_an_immediate_restart_after_cancelling_a_later_one_is_checked(gateway: Gateway) -> None:
+    reader, _, task = await gateway.bootstrapped()
+    for packet_id, seconds in enumerate((3600, -1, 0), start=300):
+        send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=seconds), packet_id))
+    await wait_until(lambda: gateway.radio.status_requests() == 1)
+    assert gateway.interface._restart_checks == []  # the hour-long one went with its cancellation
+    reader.feed_eof()
+    await task
+
+
+async def test_a_write_during_a_restart_check_is_checked_after_it(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(aio_interface, "_RESTART_DELAY_S", 0.02)
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.02)
+    entered, release, calls = asyncio.Event(), asyncio.Event(), []
+
+    async def held_check(timeout_s: float) -> None:
+        calls.append(timeout_s)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(gateway.interface, "_check_connection", held_check)
+    await gateway.radio.send_packet(set_owner_write())
+    await entered.wait()
+    await gateway.radio.send_packet(set_owner_write())
+    release.set()
+    await wait_until(lambda: len(calls) == 2)
+
+
+class HeldQueue:
+    """Hold the radio's queue full, so a commit of ours waits to be sent, until release()."""
+
+    def __init__(self, gateway: Gateway) -> None:
+        self.gateway = gateway
+        gateway.radio._queue_status = mesh_pb2.QueueStatus(free=0, maxlen=16)
+
+    def release(self) -> None:
+        self.gateway.radio.emit(mesh_pb2.FromRadio(queueStatus=mesh_pb2.QueueStatus(free=16, maxlen=16)))
+
+
+async def our_commit_waiting(gateway: Gateway, caplog: pytest.LogCaptureFixture) -> HeldQueue:
+    await gateway.radio.forward(admin_write(BEGIN).SerializeToString(), admin_write(BEGIN))
+    held = HeldQueue(gateway)
+    await wait_until(lambda: "committing it so the settings written since are saved" in caplog.text)
+    assert gateway.radio.admin_sent("commit_edit_settings") == []
+    return held
+
+
+@pytest.mark.usefixtures("quick_edits")
+async def test_our_commit_of_an_abandoned_transaction_does_not_outlive_its_session(
+    gateway: Gateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    held = await our_commit_waiting(gateway, caplog)
+    await gateway.interface._reconnect_while_running(force=True)
+    held.release()
+    await asyncio.sleep(0.3)
+    assert gateway.radio.admin_sent("commit_edit_settings") == []  # never sent to the radio's new session
+
+
+@pytest.mark.usefixtures("quick_edits")
+async def test_our_waiting_commit_gives_way_to_a_clients_commit(
+    gateway: Gateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    held = await our_commit_waiting(gateway, caplog)
+    await gateway.radio.forward(admin_write(COMMIT, 900).SerializeToString(), admin_write(COMMIT, 900))
+    held.release()
+    await asyncio.sleep(0.5)
+    assert [p.packet.id for p in gateway.radio.admin_sent("commit_edit_settings")] == [900]
+
+
+@pytest.mark.usefixtures("quick_edits")
+async def test_our_waiting_commit_gives_way_to_a_new_transaction(
+    gateway: Gateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    held = await our_commit_waiting(gateway, caplog)
+    await gateway.radio.forward(admin_write(BEGIN, 901).SerializeToString(), admin_write(BEGIN, 901))
+    held.release()
+    await asyncio.sleep(0.1)
+    assert gateway.radio.admin_sent("commit_edit_settings") == []  # the new one gets its own idle time
+    await wait_until(lambda: len(gateway.radio.admin_sent("commit_edit_settings")) == 1)
+
+
+async def test_a_check_waiting_on_a_later_restart_still_checks_an_immediate_one(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.05)
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=3600), 300))
+    await wait_until(lambda: gateway.interface._restart_probe is not None)
+    await asyncio.sleep(0.05)  # the check is now waiting for the hour to pass
+    send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=-1), 301))
+    send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=0), 302))
+    await wait_until(lambda: gateway.radio.status_requests() == 1)
+    reader.feed_eof()
+    await task
+
+
+async def test_cancelling_a_reboot_keeps_the_check_for_a_shutdown(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.05)
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(admin_pb2.AdminMessage(shutdown_seconds=0), 300))
+    send(reader, admin_write(admin_pb2.AdminMessage(reboot_seconds=-1), 301))  # firmware's separate timers
+    await wait_until(lambda: gateway.radio.status_requests() == 1)
+    reader.feed_eof()
+    await task
+
+
+async def test_cancelling_a_later_reboot_keeps_an_earlier_shutdowns_check(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.05)
+    reader, _, task = await gateway.bootstrapped()
+    for packet_id, admin in enumerate(
+        [
+            admin_pb2.AdminMessage(shutdown_seconds=0),
+            admin_pb2.AdminMessage(reboot_seconds=3600),
+            admin_pb2.AdminMessage(reboot_seconds=-1),
+        ],
+        start=300,
+    ):
+        send(reader, admin_write(admin, packet_id))
+    await wait_until(lambda: gateway.radio.status_requests() == 1)
+    reader.feed_eof()
+    await task
+
+
+@pytest.fixture
+def quick_edits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(aio_interface, "_EDIT_IDLE_S", 0.3)
+
+
+@pytest.mark.usefixtures("quick_restarts", "quick_edits")
+async def test_an_abandoned_settings_transaction_is_committed_once(
+    gateway: Gateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(BEGIN))
+    send(reader, mesh_pb2.ToRadio(disconnect=True))  # the client goes away in the middle
+    await task
+    await wait_until(lambda: gateway.radio.admin_sent("commit_edit_settings") != [])
+    (commit,) = gateway.radio.admin_sent("commit_edit_settings")
+    assert commit.packet.to == OWN
+    await wait_until(lambda: gateway.radio.status_requests() == 1)  # then the restart it causes is checked
+    await asyncio.sleep(0.4)
+    assert len(gateway.radio.admin_sent("commit_edit_settings")) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert sum("committing it so the settings written since are saved" in w for w in warnings) == 1
+
+
+@pytest.mark.usefixtures("quick_edits")
+async def test_writes_in_a_transaction_from_anyone_keep_it_open(gateway: Gateway) -> None:
+    reader, _, task = await gateway.bootstrapped()
+    send(reader, admin_write(BEGIN))
+    await asyncio.sleep(0.2)
+    # Home Assistant's own write is sent at once, not held behind the client's transaction
+    await gateway.interface.send_admin_message(OWN, admin_pb2.AdminMessage(set_config={"device": {}}), ack=False)
+    assert gateway.radio.admin_sent("set_config") != []
+    await asyncio.sleep(0.2)
+    assert gateway.radio.admin_sent("commit_edit_settings") == []  # 0.4 s after the begin, 0.2 s after the write
+    await wait_until(lambda: gateway.radio.admin_sent("commit_edit_settings") != [])
+    reader.feed_eof()
+    await task
+
+
+@pytest.mark.usefixtures("quick_edits")
+async def test_transactions_interleaved_by_two_clients_reach_the_radio_in_order(gateway: Gateway) -> None:
+    reader_a, _, task_a = await gateway.bootstrapped(1)
+    reader_b, _, task_b = await gateway.bootstrapped(2)
+    sent = len(gateway.radio.sent)
+    for reader, admin, packet_id in [
+        (reader_a, BEGIN, 1),
+        (reader_b, BEGIN, 2),
+        (reader_a, SET_LORA, 3),
+        (reader_b, COMMIT, 4),  # firmware has one transaction: this commits both clients' writes
+        (reader_a, COMMIT, 5),
+    ]:
+        send(reader, admin_write(admin, packet_id))
+        await wait_until(lambda: len(gateway.radio.sent) > sent)  # noqa: B023 - waited on before the next
+        sent = len(gateway.radio.sent)
+    assert [p.packet.id for p in gateway.radio.sent if p.packet.decoded.portnum == portnums_pb2.PortNum.ADMIN_APP][
+        -5:
+    ] == [1, 2, 3, 4, 5]
+    await asyncio.sleep(0.4)
+    assert len(gateway.radio.admin_sent("commit_edit_settings")) == 2  # both the clients', none of our own
+    for reader, task in ((reader_a, task_a), (reader_b, task_b)):
+        assert not task.done()
+        reader.feed_eof()
+        await task
+
+
+@pytest.mark.usefixtures("quick_edits")
+@pytest.mark.parametrize("case", ["committed elsewhere", "reconnected", "another node"])
+async def test_a_transaction_that_is_not_ours_to_commit_is_left_alone(gateway: Gateway, case: str) -> None:
+    reader, _, _ = await gateway.bootstrapped()
+    send(reader, admin_write(BEGIN, to=5 if case == "another node" else OWN))
+    await wait_until(lambda: gateway.radio.admin_sent("begin_edit_settings") != [] or case == "another node")
+    if case == "committed elsewhere":
+        other, _, _ = await gateway.bootstrapped(2)
+        send(other, admin_write(COMMIT, 2))
+        await wait_until(lambda: gateway.radio.admin_sent("commit_edit_settings") != [])
+    elif case == "reconnected":
+        gateway.radio.incoming.put_nowait(ClientApiConnectionInterruptedError("link dropped"))
+        await wait_until(lambda: len(gateway.radio.config_requests()) == 2)
+    await asyncio.sleep(0.5)
+    assert len(gateway.radio.admin_sent("commit_edit_settings")) == (case == "committed elsewhere")
 
 
 def reply_to(request_id: int) -> mesh_pb2.FromRadio:

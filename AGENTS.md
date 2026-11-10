@@ -76,7 +76,8 @@ coordinator.py the node database as coordinator data, keyed by node number
   The cache belongs to the `ClientApiConnection` and is fed as packets are read, so it sees every packet,
   including a reconnect's bootstrap that only `request_config()` reads. Other clients' writes go through
   `connection.forward()` and Home Assistant's own through `send_packet()`; both call `note_write()` before and
-  after, which marks the snapshot stale and starts the refresh download.
+  after, which marks the snapshot stale and starts the refresh download, and `on_write` after, which feeds
+  `MeshInterface`'s restart check and settings-transaction watch.
 - **Generated protobufs are vendored.** After a submodule bump, regenerate, then compare old and new
   descriptors for removed or renamed fields before merging; v2.8 protos qualify custom options with the
   package, which the generator rewrites.

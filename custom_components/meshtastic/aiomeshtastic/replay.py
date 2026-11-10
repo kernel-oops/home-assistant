@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from google.protobuf.message import DecodeError
 
+from .admin import changes_gateway, gateway_admin
 from .protobuf import admin_pb2, mesh_pb2, portnums_pb2, telemetry_pb2, xmodem_pb2
 
 LOGGER = logging.getLogger(__package__)
@@ -63,41 +64,13 @@ _MODULE_CONFIGS = {
     "audio", "remote_hardware", "neighbor_info", "ambient_lighting", "detection_sensor", "paxcounter",
 }  # fmt: skip
 
-# admin variants that change nothing a bootstrap carries; any other one sent to the gateway does
-_ADMIN_NOT_STATE = frozenset({"set_time_only", "begin_edit_settings", "send_input_event"})
 # admin that takes nodes out of the gateway's node DB, so their replayed state would bring them back in the app
 _FORGETS_NODES = frozenset({"nodedb_reset", "factory_reset_config", "factory_reset_device"})
 # a bootstrap whose my_info came this soon after a write may have been read before the radio applied it
 _WRITE_SETTLE_S = 2.0
-# destinations the firmware handles itself, besides its own node number: broadcast and local-only broadcast
-_LOCAL_DESTINATIONS = {0, 1, 0xFFFFFFFF}
 
 # called with each live record and its history sequence number (0 if it is not a text), or None when invalidated
 Subscriber = Callable[[bytes | None, int], None]
-
-
-def gateway_admin(to_radio: mesh_pb2.ToRadio, my_node_num: int | None) -> admin_pb2.AdminMessage | None:
-    """
-    Return the admin message of a ToRadio for the gateway itself, or None if it is not one.
-
-    With the gateway's node number unknown, every admin message counts as for the gateway. One that does not
-    decode is returned empty, which counts as a change.
-    """
-    packet = to_radio.packet
-    if packet.decoded.portnum != portnums_pb2.PortNum.ADMIN_APP:
-        return None
-    if my_node_num is not None and packet.to != my_node_num and packet.to not in _LOCAL_DESTINATIONS:
-        return None
-    try:
-        return admin_pb2.AdminMessage.FromString(packet.decoded.payload)
-    except DecodeError:
-        return admin_pb2.AdminMessage()
-
-
-def changes_gateway(admin: admin_pb2.AdminMessage) -> bool:
-    """Return whether gateway admin changes what a bootstrap carries; empty or unreadable admin counts."""
-    variant = admin.WhichOneof("payload_variant")
-    return variant is None or not (variant.startswith("get_") or variant in _ADMIN_NOT_STATE)
 
 
 @dataclass(frozen=True)
