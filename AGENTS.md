@@ -65,6 +65,18 @@ coordinator.py the node database as coordinator data, keyed by node number
 - **The bundled web client is built, never edited.** Change `scripts/web-client/patches` and rerun
   `scripts/build_web_client`. Home Assistant serves the files case-sensitively, so a rebuild on macOS must not
   keep a stale tracked name; `test_web_client_paths.py` checks every file `index.html` references.
+- **The TCP proxy forwards every `ToRadio` but `want_config_id` and `disconnect`.** `server._NOT_FORWARDED`
+  may not grow: a feature protects the cache by marking it stale or by sequencing, never by refusing or dropping
+  what clients could send before, and the descriptor-driven `test_every_*_reaches_the_radio_as_sent` tests are
+  the gate. Proxy clients are served from `aiomeshtastic/replay.py`: the last complete bootstrap of the gateway
+  session's latest config request (Home Assistant's or the web client's), kept as received, recent incoming
+  texts, and each node's latest position, telemetry and status. A write makes the snapshot stale for new clients
+  only (`ReplayCache.stale`); only a new radio session closes bound clients (`invalidate`, from `stop()`, the
+  reconnect and `rebooted`), so any new path that opens a session must invalidate before its first record.
+  The cache belongs to the `ClientApiConnection` and is fed as packets are read, so it sees every packet,
+  including a reconnect's bootstrap that only `request_config()` reads. Other clients' writes go through
+  `connection.forward()` and Home Assistant's own through `send_packet()`; both call `note_write()` before and
+  after, which marks the snapshot stale and starts the refresh download.
 - **Generated protobufs are vendored.** After a submodule bump, regenerate, then compare old and new
   descriptors for removed or renamed fields before merging; v2.8 protos qualify custom options with the
   package, which the generator rewrites.

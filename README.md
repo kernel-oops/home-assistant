@@ -424,9 +424,42 @@ To open the web client:
 2. Open the "Meshtastic" sidebar item. If you don't see it, reload the Home Assistant interface.
 3. Press "Open" on the gateway. The web client connects to it on its own.
 
+## TCP proxy
+
+When enabled in the integration's options, the gateway also listens on a TCP port (4403 by default) that
+Meshtastic apps and tools can connect to as if it were the radio, while Home Assistant keeps the radio's only
+API connection to itself.
+
+- **Recent messages on connect.** An app connecting through the proxy is sent the text messages the gateway
+  received in the last 24 hours (up to 256), followed by live traffic. Messages are replayed exactly as
+  received, with their original sender, packet id and reception time, so an app that already has one should
+  recognise it; an app reconnecting may still be shown messages it has seen before. The latest position,
+  device and environment telemetry and status of each node are sent too, as firmware 2.8 does after its node
+  list, again as received rather than as new. Only what the gateway received while Home Assistant was
+  connected is kept, in memory: nothing survives a Home Assistant restart, and the gateway's own sent
+  messages are not replayed.
+- **Connecting does not disturb the radio.** An app's configuration request is answered from the gateway's
+  last complete configuration download instead of being passed to the radio, so other apps and Home Assistant
+  carry on undisturbed. After the radio reconnects or restarts, apps are disconnected and served again once
+  Home Assistant's next download completes. A setting change, by Home Assistant, the bundled web client or an
+  app through the proxy, leaves connected apps connected; Home Assistant downloads the configuration again a
+  few seconds after the last write, an app connecting meanwhile waits for that download, and a download it
+  could not use is retried for a while before giving up until the next reconnect. Connecting the bundled web
+  client starts a new download too. Changes made to the radio by other means, for example over Bluetooth, are
+  not seen until the next download. The proxy needs firmware 2.5 or later.
+- **What reaches the radio.** Everything an app sends is passed to the radio as sent, as before: messages and
+  other mesh packets, admin for the gateway or other nodes (settings, owner, channels, favourite, ignored and
+  deleted nodes, reboot and reset), file transfers and MQTT proxy messages. Only a configuration request,
+  answered as above, and a disconnect, which closes just that app's connection, stay with the proxy. A node
+  an app deletes or ignores is not brought back by the replayed messages and positions.
+- **Security.** The proxy has no authentication. Anyone who can reach the port receives the gateway's
+  private key and channel keys with its configuration, and can send messages as the gateway. Encrypted
+  packets are passed on without inspection. Only enable it on a network you trust.
+
 ## Known limitations
 
-- A radio serves one phone-API client at a time. The Meshtastic phone apps and other tools can only connect while this integration is not using the radio, unless you enable the [web client](#meshtastic-web-client) or the TCP proxy and connect through it.
+- A radio serves one phone-API client at a time. The Meshtastic phone apps and other tools can only connect while this integration is not using the radio, unless you enable the [web client](#meshtastic-web-client) or the [TCP proxy](#tcp-proxy) and connect through it.
+- Apps connected through the TCP proxy share the radio's one session, as they always have: the radio's replies to one app's messages, such as delivery acknowledgements, reach every connected app, and two apps can by chance use the same packet id.
 - Messages are sent and received through the gateway radio only. Nodes the gateway does not hear are not reachable.
 - Waypoint geofence enter and exit are evaluated by the device and are not reported as events.
 - The TCP proxy has no authentication: anyone who can reach its port controls the gateway.
@@ -434,7 +467,7 @@ To open the web client:
 
 ## Troubleshooting
 
-- **Gateway keeps disconnecting or fails to connect:** another client, such as a phone app or script, holds the radio's single API connection. Close it, or share the connection through the TCP proxy or web client.
+- **Gateway keeps disconnecting or fails to connect:** another client, such as a phone app or script, holds the radio's single API connection. Close it, or share the connection through the web client or the [TCP proxy](#tcp-proxy).
 - **Node moved or shows twice after a firmware upgrade:** see [Node numbers on firmware 2.8](#node-numbers-on-firmware-28). A reset or key change creates a new node.
 - **Different address for the same radio:** use **Reconfigure** on the entry, see above.
 - **Logs:** Home Assistant writes them to **Settings** > **System** > **Logs**. Turn on debug logging for the integration and its libraries in `configuration.yaml`, then restart:
