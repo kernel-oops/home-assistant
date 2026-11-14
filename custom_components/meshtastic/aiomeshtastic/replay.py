@@ -27,8 +27,8 @@ LOGGER = logging.getLogger(__package__)
 NONCE_ONLY_CONFIG = 69420
 NONCE_ONLY_NODES = 69421
 
+# bounded by count only, as the radio bounds its own store by size: a clock would empty it on a quiet mesh
 HISTORY_SIZE = 256
-HISTORY_MAX_AGE_S = 24 * 3600
 # latest position, telemetry and status per node, which firmware 2.8 sends after the completion, not in it
 NODE_STATE_SIZE = 2048
 _NODE_STATE_PORTS = {portnums_pb2.PortNum.POSITION_APP, portnums_pb2.PortNum.NODE_STATUS_APP}
@@ -115,11 +115,11 @@ class ReplayCache:
         self._pending: list[tuple[str, bytes]] | None = None
         self._identity: tuple | None = None
         self.my_node_num: int | None = None
-        # (monotonic receipt time, sequence number, raw FromRadio)
-        self._history: deque[tuple[float, int, bytes]] = deque(maxlen=HISTORY_SIZE)
+        # (sequence number, raw FromRadio)
+        self._history: deque[tuple[int, bytes]] = deque(maxlen=HISTORY_SIZE)
         self._history_seq = 0
-        # (sender, port, telemetry variant) -> (monotonic receipt time, raw FromRadio), oldest update first
-        self._node_state: dict[tuple, tuple[float, bytes]] = {}
+        # (sender, port, telemetry variant) -> raw FromRadio, oldest update first
+        self._node_state: dict[tuple, bytes] = {}
         self._subscribers: set[Subscriber] = set()
         # why the last bootstrap was not kept, and who to tell
         self.failure: str | None = None
@@ -153,11 +153,10 @@ class ReplayCache:
         if kind == "packet":
             if self._is_incoming_text(from_radio.packet):
                 self._history_seq = seq = self._history_seq + 1
-                self._history.append((time.monotonic(), seq, raw))
-                self._prune()
+                self._history.append((seq, raw))
             elif key := self._node_state_key(from_radio.packet):
                 self._node_state.pop(key, None)
-                self._node_state[key] = (time.monotonic(), raw)
+                self._node_state[key] = raw
                 if len(self._node_state) > NODE_STATE_SIZE:
                     del self._node_state[next(iter(self._node_state))]
         for subscriber in list(self._subscribers):
@@ -206,7 +205,7 @@ class ReplayCache:
             num = getattr(admin, variant)
             self._node_state = {key: value for key, value in self._node_state.items() if key[0] != num}
             if variant == "set_ignored_node":  # firmware also drops an ignored node's stored messages
-                kept = [entry for entry in self._history if _sender(entry[2]) != num]
+                kept = [entry for entry in self._history if _sender(entry[1]) != num]
                 self._history = deque(kept, maxlen=HISTORY_SIZE)
 
     def stale(self, reason: str) -> None:
@@ -233,11 +232,9 @@ class ReplayCache:
         """
         if self.snapshot is None:
             return None
-        self._prune()
         self._subscribers.add(subscriber)
-        cutoff = time.monotonic() - HISTORY_MAX_AGE_S
-        node_state = [raw for received, raw in self._node_state.values() if received >= cutoff]
-        return Bound(self.snapshot, node_state, [(seq, raw) for _, seq, raw in self._history if seq > after_seq])
+        history = [(seq, raw) for seq, raw in self._history if seq > after_seq]
+        return Bound(self.snapshot, list(self._node_state.values()), history)
 
     def subscribe(self, subscriber: Subscriber) -> None:
         """Pass live records to a client that has not asked for config, until the radio session ends."""
@@ -273,11 +270,6 @@ class ReplayCache:
         self.failure = reason
         if self.on_failure is not None:
             self.on_failure()
-
-    def _prune(self) -> None:
-        cutoff = time.monotonic() - HISTORY_MAX_AGE_S
-        while self._history and self._history[0][0] < cutoff:
-            self._history.popleft()
 
     def _complete(self, config_complete_id: int, requested_config_id: int | None) -> None:
         pending, self._pending = self._pending, None

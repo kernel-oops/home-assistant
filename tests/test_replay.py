@@ -112,7 +112,7 @@ def test_history_survives_invalidation_and_is_live_to_subscribers_once() -> None
     cache.ingest(packet(5, 2), NONCE)  # after invalidation nobody is subscribed
     assert seen == [(packet(5, 1).SerializeToString(), 1), (None, 0)]
     assert cache.bind(lambda *_: None) is None
-    assert cache._history[-1][1:] == (2, packet(5, 2).SerializeToString())
+    assert cache._history[-1] == (2, packet(5, 2).SerializeToString())
 
 
 def test_a_write_or_a_refresh_leaves_bound_clients_on_their_session() -> None:
@@ -129,19 +129,24 @@ def test_a_write_or_a_refresh_leaves_bound_clients_on_their_session() -> None:
     assert cache.snapshot.generation == 2
 
 
-def test_history_is_bounded_by_count_and_age(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = [1000.0]
-    monkeypatch.setattr(replay.time, "monotonic", lambda: now[0])
+def test_history_is_bounded_by_count() -> None:
     cache = committed()
     for packet_id in range(300):
-        now[0] += 1
         cache.ingest(packet(5, packet_id), NONCE)
     assert texts(cache) == [packet(5, i).SerializeToString() for i in range(44, 300)]
 
-    now[0] = 1001 + 144 + replay.HISTORY_MAX_AGE_S - 0.5  # text i arrived at 1001 + i; those before 144 are a day old
-    assert texts(cache) == [packet(5, i).SerializeToString() for i in range(144, 300)]
-    now[0] += 1000
-    assert texts(cache) == []
+
+def test_history_and_node_state_older_than_a_day_are_still_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(replay.time, "monotonic", lambda: now[0])
+    cache = committed()
+    position = packet(6, 1, portnums_pb2.PortNum.POSITION_APP, b"")
+    for record in (packet(5, 1), position):
+        cache.ingest(record, NONCE)
+    now[0] += 3 * 24 * 3600  # a quiet mesh: three days with nothing new
+    bound = cache.bind(lambda *_: None)
+    assert bound.history == [(1, packet(5, 1).SerializeToString())]
+    assert bound.node_state == [position.SerializeToString()]
 
 
 def test_history_is_cleared_when_gateway_identity_changes() -> None:
@@ -171,10 +176,8 @@ def telemetry(sender: int, packet_id: int, **variant: object) -> FromRadio:
     return packet(sender, packet_id, portnums_pb2.PortNum.TELEMETRY_APP, payload)
 
 
-def test_node_state_keeps_the_latest_position_telemetry_and_status_per_node(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_node_state_keeps_the_latest_position_telemetry_and_status_per_node() -> None:
     port = portnums_pb2.PortNum
-    now = [1000.0]
-    monkeypatch.setattr(replay.time, "monotonic", lambda: now[0])
     cache = committed()
     kept = [
         packet(6, 1, port.POSITION_APP, b""),  # replaced by 5 below
@@ -193,9 +196,6 @@ def test_node_state_keeps_the_latest_position_telemetry_and_status_per_node(monk
     for record in kept + ignored:
         cache.ingest(record, NONCE)
     assert cache.bind(lambda *_: None).node_state == [r.SerializeToString() for r in kept[1:]]
-
-    now[0] += replay.HISTORY_MAX_AGE_S + 1
-    assert cache.bind(lambda *_: None).node_state == []
 
 
 def test_node_state_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -431,9 +431,13 @@ Meshtastic apps and tools can connect to as if it were the radio, while Home Ass
 API connection to itself.
 
 - **Recent messages on connect.** An app connecting through the proxy is sent the text messages the gateway
-  received in the last 24 hours (up to 256), followed by live traffic. Messages are replayed exactly as
-  received, with their original sender, packet id and reception time, so an app that already has one should
-  recognise it; an app reconnecting may still be shown messages it has seen before. The latest position,
+  received, up to the latest 256 however old they are, followed by live traffic. Like the radio's own store,
+  this is bounded by count rather than by age, so a quiet mesh still has its messages after days away.
+  Messages are replayed exactly as received, with their original sender, packet id and reception time, so an
+  app that already has one should recognise it; an app reconnecting may still be shown messages it has seen
+  before. Packet ids are random 32-bit numbers that are only meant to be unique for a short while, so in
+  principle an old replayed message could share an id with a newer one and an app that de-duplicates by id
+  could hide the wrong one; with at most 256 kept the chance is negligible. The latest position,
   device and environment telemetry and status of each node are sent too, as firmware 2.8 does after its node
   list, again as received rather than as new. Only what the gateway received while Home Assistant was
   connected is kept, in memory: nothing survives a Home Assistant restart, and the gateway's own sent

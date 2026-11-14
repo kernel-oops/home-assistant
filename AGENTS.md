@@ -70,7 +70,7 @@ coordinator.py the node database as coordinator data, keyed by node number
   what clients could send before, and the descriptor-driven `test_every_*_reaches_the_radio_as_sent` tests are
   the gate. Proxy clients are served from `aiomeshtastic/replay.py`: the last complete bootstrap of the gateway
   session's latest config request (Home Assistant's or the web client's), kept as received, recent incoming
-  texts, and each node's latest position, telemetry and status. A write makes the snapshot stale for new clients
+  texts, and each node's latest position, telemetry and status, bounded by count and never by age. A write makes the snapshot stale for new clients
   only (`ReplayCache.stale`); only a new radio session closes bound clients (`invalidate`, from `stop()`, the
   reconnect and `rebooted`), so any new path that opens a session must invalidate before its first record.
   The cache belongs to the `ClientApiConnection` and is fed as packets are read, so it sees every packet,
