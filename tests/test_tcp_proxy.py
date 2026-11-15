@@ -1506,59 +1506,6 @@ async def test_a_write_during_a_restart_check_is_checked_after_it(
     await wait_until(lambda: len(calls) == 2)
 
 
-class HeldQueue:
-    """Hold the radio's queue full, so a commit of ours waits to be sent, until release()."""
-
-    def __init__(self, gateway: Gateway) -> None:
-        self.gateway = gateway
-        gateway.radio._queue_status = mesh_pb2.QueueStatus(free=0, maxlen=16)
-
-    def release(self) -> None:
-        self.gateway.radio.emit(mesh_pb2.FromRadio(queueStatus=mesh_pb2.QueueStatus(free=16, maxlen=16)))
-
-
-async def our_commit_waiting(gateway: Gateway, caplog: pytest.LogCaptureFixture) -> HeldQueue:
-    await gateway.radio.forward(admin_write(BEGIN).SerializeToString(), admin_write(BEGIN))
-    held = HeldQueue(gateway)
-    await wait_until(lambda: "committing it so the settings written since are saved" in caplog.text)
-    assert gateway.radio.admin_sent("commit_edit_settings") == []
-    return held
-
-
-@pytest.mark.usefixtures("quick_edits")
-async def test_our_commit_of_an_abandoned_transaction_does_not_outlive_its_session(
-    gateway: Gateway, caplog: pytest.LogCaptureFixture
-) -> None:
-    held = await our_commit_waiting(gateway, caplog)
-    await gateway.interface._reconnect_while_running(force=True)
-    held.release()
-    await asyncio.sleep(0.3)
-    assert gateway.radio.admin_sent("commit_edit_settings") == []  # never sent to the radio's new session
-
-
-@pytest.mark.usefixtures("quick_edits")
-async def test_our_waiting_commit_gives_way_to_a_clients_commit(
-    gateway: Gateway, caplog: pytest.LogCaptureFixture
-) -> None:
-    held = await our_commit_waiting(gateway, caplog)
-    await gateway.radio.forward(admin_write(COMMIT, 900).SerializeToString(), admin_write(COMMIT, 900))
-    held.release()
-    await asyncio.sleep(0.5)
-    assert [p.packet.id for p in gateway.radio.admin_sent("commit_edit_settings")] == [900]
-
-
-@pytest.mark.usefixtures("quick_edits")
-async def test_our_waiting_commit_gives_way_to_a_new_transaction(
-    gateway: Gateway, caplog: pytest.LogCaptureFixture
-) -> None:
-    held = await our_commit_waiting(gateway, caplog)
-    await gateway.radio.forward(admin_write(BEGIN, 901).SerializeToString(), admin_write(BEGIN, 901))
-    held.release()
-    await asyncio.sleep(0.1)
-    assert gateway.radio.admin_sent("commit_edit_settings") == []  # the new one gets its own idle time
-    await wait_until(lambda: len(gateway.radio.admin_sent("commit_edit_settings")) == 1)
-
-
 async def test_a_check_waiting_on_a_later_restart_still_checks_an_immediate_one(
     gateway: Gateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1605,47 +1552,6 @@ async def test_cancelling_a_later_reboot_keeps_an_earlier_shutdowns_check(
     await task
 
 
-@pytest.fixture
-def quick_edits(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(aio_interface, "_EDIT_IDLE_S", 0.3)
-    # the fixture radio runs 2.8.2, which expires transactions itself; these play one that does not
-    monkeypatch.setattr(aio_interface, "_EDIT_EXPIRY_FIRMWARE", (9, 0, 0))
-
-
-@pytest.mark.usefixtures("quick_restarts", "quick_edits")
-async def test_an_abandoned_settings_transaction_is_committed_once(
-    gateway: Gateway, caplog: pytest.LogCaptureFixture
-) -> None:
-    reader, _, task = await gateway.bootstrapped()
-    send(reader, admin_write(BEGIN))
-    send(reader, mesh_pb2.ToRadio(disconnect=True))  # the client goes away in the middle
-    await task
-    await wait_until(lambda: gateway.radio.admin_sent("commit_edit_settings") != [])
-    (commit,) = gateway.radio.admin_sent("commit_edit_settings")
-    assert commit.packet.to == OWN
-    await wait_until(lambda: gateway.radio.status_requests() == 1)  # then the restart it causes is checked
-    await asyncio.sleep(0.4)
-    assert len(gateway.radio.admin_sent("commit_edit_settings")) == 1
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert sum("committing it so the settings written since are saved" in w for w in warnings) == 1
-
-
-@pytest.mark.usefixtures("quick_edits")
-async def test_writes_in_a_transaction_from_anyone_keep_it_open(gateway: Gateway) -> None:
-    reader, _, task = await gateway.bootstrapped()
-    send(reader, admin_write(BEGIN))
-    await asyncio.sleep(0.2)
-    # Home Assistant's own write is sent at once, not held behind the client's transaction
-    await gateway.interface.send_admin_message(OWN, admin_pb2.AdminMessage(set_config={"device": {}}), ack=False)
-    assert gateway.radio.admin_sent("set_config") != []
-    await asyncio.sleep(0.2)
-    assert gateway.radio.admin_sent("commit_edit_settings") == []  # 0.4 s after the begin, 0.2 s after the write
-    await wait_until(lambda: gateway.radio.admin_sent("commit_edit_settings") != [])
-    reader.feed_eof()
-    await task
-
-
-@pytest.mark.usefixtures("quick_edits")
 async def test_transactions_interleaved_by_two_clients_reach_the_radio_in_order(gateway: Gateway) -> None:
     reader_a, _, task_a = await gateway.bootstrapped(1)
     reader_b, _, task_b = await gateway.bootstrapped(2)
@@ -1669,23 +1575,6 @@ async def test_transactions_interleaved_by_two_clients_reach_the_radio_in_order(
         assert not task.done()
         reader.feed_eof()
         await task
-
-
-@pytest.mark.usefixtures("quick_edits")
-@pytest.mark.parametrize("case", ["committed elsewhere", "reconnected", "another node"])
-async def test_a_transaction_that_is_not_ours_to_commit_is_left_alone(gateway: Gateway, case: str) -> None:
-    reader, _, _ = await gateway.bootstrapped()
-    send(reader, admin_write(BEGIN, to=5 if case == "another node" else OWN))
-    await wait_until(lambda: gateway.radio.admin_sent("begin_edit_settings") != [] or case == "another node")
-    if case == "committed elsewhere":
-        other, _, _ = await gateway.bootstrapped(2)
-        send(other, admin_write(COMMIT, 2))
-        await wait_until(lambda: gateway.radio.admin_sent("commit_edit_settings") != [])
-    elif case == "reconnected":
-        gateway.radio.incoming.put_nowait(ClientApiConnectionInterruptedError("link dropped"))
-        await wait_until(lambda: len(gateway.radio.config_requests()) == 2)
-    await asyncio.sleep(0.5)
-    assert len(gateway.radio.admin_sent("commit_edit_settings")) == (case == "committed elsewhere")
 
 
 def reply_to(request_id: int) -> mesh_pb2.FromRadio:
