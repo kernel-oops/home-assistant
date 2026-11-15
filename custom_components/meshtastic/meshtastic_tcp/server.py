@@ -23,8 +23,8 @@ _LOGGER = LOGGER.getChild(__name__)
 _WRITE_TIMEOUT_S = 30.0
 # live FromRadio messages buffered per client while it is sent its bootstrap and history, and after
 _CLIENT_QUEUE_SIZE = 1024
-# how long a client asking for config waits for the gateway's own bootstrap to complete
-_SNAPSHOT_WAIT_S = 30.0
+# clients held at once while there is no snapshot; each holds up to _CLIENT_QUEUE_SIZE live frames meanwhile
+_MAX_WAITING = 16
 # wait_closed() can hang on a peer that does not read, or raise on a broken one
 _CLOSE_TIMEOUT_S = 5.0
 
@@ -176,6 +176,8 @@ class _ProxyClient:
 
     def _on_record(self, from_radio: bytes | None, seq: int) -> None:
         if from_radio is None:
+            # deliberately, unlike before the cache: a client must not carry a session across two radio sessions,
+            # whose bootstraps, node numbers and keys may differ; it reconnects and is served the new one
             _LOGGER.info("Gateway session ended, disconnecting proxy client %s", self._peer_name)
             self.closed.set()
             return
@@ -209,17 +211,24 @@ class _ProxyClient:
             self.closed.set()
 
     async def _bootstrap(self, nonce: int) -> bool:
-        try:
-            async with asyncio.timeout(_SNAPSHOT_WAIT_S):
+        # never ask the radio for the client: that would restart Home Assistant's own session. It waits instead,
+        # receiving live traffic, until Home Assistant's download completes; one is started if none is under way.
+        # The wait ends with the radio session, which disconnects it, or when its queue overflows
+        if (bound := self._cache.bind(self._on_record, self._text_seq)) is None:
+            if self._cache.waiting >= _MAX_WAITING:
+                _LOGGER.warning(
+                    "%d proxy clients already wait for the gateway, closing %s", _MAX_WAITING, self._peer_name
+                )
+                self.closed.set()
+                return False
+            _LOGGER.info("Proxy client %s waits for the gateway's configuration download", self._peer_name)
+            self._cache.waiting += 1
+            try:
                 while (bound := self._cache.bind(self._on_record, self._text_seq)) is None:
+                    self._cache.want()
                     await self._cache.ready.wait()
-        except TimeoutError:
-            # never ask the radio instead: that would restart Home Assistant's own session
-            _LOGGER.warning(
-                "No complete gateway bootstrap within %s s, refusing proxy client %s", _SNAPSHOT_WAIT_S, self._peer_name
-            )
-            self.closed.set()
-            return False
+            finally:
+                self._cache.waiting -= 1
 
         # what was already queued for this client arrived before binding: its texts are merged with the history,
         # which may no longer hold the oldest of them, and the rest follows; later arrivals stay queued

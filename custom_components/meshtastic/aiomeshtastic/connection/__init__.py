@@ -76,6 +76,9 @@ class ClientApiConnection:
         # reconnect's bootstrap is read by request_config() alone, before the interface listens again
         self.replay_cache = ReplayCache()
         self.replay_cache.on_failure = self._replay_failed
+        self.replay_cache.on_wanted = self._replay_wanted
+        # set once retries give up, so waiting clients do not make the radio download again until a reconnect
+        self._replay_gave_up = False
         self._replay_refresh: asyncio.Task | None = None
         # when a config request this connection does not wait on itself (the web client's) was sent
         self._watched_request_at = float("-inf")
@@ -442,7 +445,7 @@ class ClientApiConnection:
         """
         Mark the replay snapshot stale for a write that changes the gateway, and download a fresh one once writes stop.
 
-        Without the refresh, proxy clients would be refused until the next reconnect, which may be days away.
+        Without the refresh, proxy clients would wait until the next reconnect, which may be days away.
         Called before and after every send: the first drops a download in flight, the second one that completed
         while the send waited.
         """
@@ -458,6 +461,10 @@ class ClientApiConnection:
                 self.on_write(to_radio)
             except Exception:
                 self._logger.warning("Watching a write to the radio failed", exc_info=True)
+
+    def _replay_wanted(self) -> None:
+        if not self._replay_gave_up and (self._replay_refresh is None or self._replay_refresh.done()):
+            self._replay_refresh = asyncio.create_task(self._refresh_replay(), name="replay-refresh")
 
     def _replay_failed(self) -> None:
         self._watched_request_at = float("-inf")  # that download is over, so no need to wait for it
@@ -509,6 +516,7 @@ class ClientApiConnection:
                 self.replay_cache.discard(f"no complete download within {_REPLAY_DOWNLOAD_TIMEOUT_S:g} s")
             if self.replay_cache.ready.is_set():
                 return
+        self._replay_gave_up = True
         self._logger.warning(
             "TCP proxy clients cannot connect until Home Assistant next reconnects to the gateway: its configuration "
             "could not be read (%s). The proxy needs firmware 2.5 or later",
@@ -612,6 +620,7 @@ class ClientApiConnection:
         Returns true if new reconnect has been performed
         """
         self.cancel_replay_refresh()  # a reconnect downloads the configuration itself
+        self._replay_gave_up = False
         async with self._reconnect_status_lock:
             reconnect_was_in_progress = self._reconnect_in_progress.is_set()
 

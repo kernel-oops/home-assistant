@@ -72,7 +72,10 @@ coordinator.py the node database as coordinator data, keyed by node number
   session's latest config request (Home Assistant's or the web client's), kept as received, recent incoming
   texts, and each node's latest position, telemetry and status, bounded by count and never by age. A write makes the snapshot stale for new clients
   only (`ReplayCache.stale`); only a new radio session closes bound clients (`invalidate`, from `stop()`, the
-  reconnect and `rebooted`), so any new path that opens a session must invalidate before its first record.
+  reconnect and `rebooted`), so any new path that opens a session must invalidate before its first record;
+  closing clients there is deliberate. A client asking for config with no snapshot is held, never refused or
+  forwarded, until one completes (`ReplayCache.want` starts a download; `server._MAX_WAITING` bounds them).
+  Live `NODEINFO_APP` updates the snapshot's node list.
   The cache belongs to the `ClientApiConnection` and is fed as packets are read, so it sees every packet,
   including a reconnect's bootstrap that only `request_config()` reads. Other clients' writes go through
   `connection.forward()` and Home Assistant's own through `send_packet()`; both call `note_write()` before and

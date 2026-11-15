@@ -444,13 +444,18 @@ API connection to itself.
   messages are not replayed.
 - **Connecting does not disturb the radio.** An app's configuration request is answered from the gateway's
   last complete configuration download instead of being passed to the radio, so other apps and Home Assistant
-  carry on undisturbed. After the radio reconnects or restarts, apps are disconnected and served again once
-  Home Assistant's next download completes. A setting change, by Home Assistant, the bundled web client or an
-  app through the proxy, leaves connected apps connected; Home Assistant downloads the configuration again a
-  few seconds after the last write, an app connecting meanwhile waits for that download, and a download it
-  could not use is retried for a while before giving up until the next reconnect. Connecting the bundled web
-  client starts a new download too. Changes made to the radio by other means, for example over Bluetooth, are
-  not seen until the next download. The proxy needs firmware 2.5 or later.
+  carry on undisturbed. Nodes the gateway hears about after that download are added to the node list apps
+  are sent, as the radio adds them to its own. When Home Assistant's connection to the radio ends, for a
+  reconnect or a restart, connected apps are disconnected on purpose, so that none carries one radio session's
+  configuration into the next; they reconnect and are served again once Home Assistant's next download
+  completes. A setting change, by Home Assistant, the bundled web client or an app through the proxy, leaves
+  connected apps connected; Home Assistant downloads the configuration again a few seconds after the last
+  write. An app that asks for its configuration while there is no usable download stays connected, receiving
+  live traffic, and is answered as soon as one completes; Home Assistant starts one if none is under way. A
+  download it could not use is retried for a while before giving up until the next reconnect, and apps keep
+  waiting meanwhile, up to 16 at once. Connecting the bundled web client starts a new download too. Changes
+  made to the radio by other means, for example over Bluetooth, are not seen until the next download. The
+  proxy needs firmware 2.5 or later.
 - **What reaches the radio.** Everything an app sends is passed to the radio as sent, as before: messages and
   other mesh packets, admin for the gateway or other nodes (settings, owner, channels, favourite, ignored and
   deleted nodes, reboot and reset), file transfers and MQTT proxy messages. Only a configuration request,

@@ -376,3 +376,40 @@ async def test_damaged_frame_in_a_bootstrap_is_not_committed(damage: bytes) -> N
     assert refresh is not None
     connection.cancel_replay_refresh()
     await asyncio.wait([refresh])
+
+
+def nodeinfo(sender: int, long_name: str) -> FromRadio:
+    user = mesh_pb2.User(id=f"!{sender:08x}", long_name=long_name)
+    data = mesh_pb2.Data(portnum=portnums_pb2.PortNum.NODEINFO_APP, payload=user.SerializeToString())
+    return FromRadio(packet=mesh_pb2.MeshPacket(id=sender, rx_time=1_800_000_000, decoded=data, **{"from": sender}))
+
+
+def snapshot_nodes(cache: ReplayCache) -> dict[int, str]:
+    nodes = [FromRadio.FromString(raw).node_info for raw in cache.snapshot.records_for(replay.NONCE_ONLY_NODES)]
+    return {node.num: node.user.long_name for node in nodes}
+
+
+def test_nodes_heard_live_are_in_the_snapshot_for_later_clients() -> None:
+    cache = committed()
+    before = snapshot_nodes(cache)
+    known, new = next(num for num in before if num != OWN), 0x7E57
+    cache.ingest(nodeinfo(known, "renamed"), NONCE)
+    cache.ingest(nodeinfo(new, "first heard after the download"), NONCE)
+    cache.ingest(nodeinfo(OWN, "not from the mesh"), NONCE)
+
+    nodes = snapshot_nodes(cache)
+    assert nodes == {**before, known: "renamed", new: "first heard after the download"}
+    # still a bootstrap in firmware order: the new node sits with the others, before the file list
+    kinds = [FromRadio.FromString(raw).WhichOneof("payload_variant") for raw, _ in cache.snapshot.records]
+    assert kinds[kinds.index("node_info") :].count("node_info") == len(nodes)
+    assert all(kind != "node_info" for kind in kinds[kinds.index("fileInfo") :])
+
+
+def test_a_client_waiting_asks_for_a_download_only_when_none_is_under_way() -> None:
+    cache, asked = ReplayCache(), []
+    cache.on_wanted = lambda: asked.append(True)
+    cache.want()
+    assert asked == [True]
+    cache.ingest(bootstrap(NONCE)[0], NONCE)  # a download under way
+    cache.want()
+    assert asked == [True]

@@ -369,23 +369,39 @@ async def test_client_waits_for_home_assistants_bootstrap_in_progress(monkeypatc
         await gateway.interface.stop()
 
 
-async def test_client_is_refused_while_there_is_no_snapshot(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_client_waiting_for_a_snapshot_starts_a_download(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(server, "_SNAPSHOT_WAIT_S", 0.1)
-    gateway = await start_gateway(monkeypatch, FakeRadio(answer=False))
-    try:
-        reader, writer, task = gateway.connect()
+    # main passed the request to the radio; the proxy holds the client until a download it starts completes
+    monkeypatch.setattr(aio_connection, "_REPLAY_REFRESH_DELAYS_S", (0.05,))
+    gateway.cache.stale("as after a download that could not be kept")
+    reader, writer, task = gateway.connect()
+    send(reader, mesh_pb2.ToRadio(want_config_id=CLIENT_NONCE))
+    await wait_until(lambda: completion(CLIENT_NONCE).SerializeToString() in writer.frames())
+    assert len(gateway.radio.config_requests()) == 2  # Home Assistant's own, then one for the waiting client
+    assert gateway.radio.disconnects() == []
+    assert not task.done()
+    reader.feed_eof()
+    await task
+
+
+async def test_waiting_clients_are_bounded(gateway: Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_MAX_WAITING", 2)
+    monkeypatch.setattr(aio_connection, "_REPLAY_REFRESH_DELAYS_S", (60.0,))
+    gateway.cache.stale("no download completes during this test")
+    clients = [gateway.connect() for _ in range(3)]
+    for reader, _, _ in clients:
         send(reader, mesh_pb2.ToRadio(want_config_id=CLIENT_NONCE))
-        async with asyncio.timeout(2):
-            await task
-        assert writer.closing
-        assert writer.frames() == []
-        assert "No complete gateway bootstrap within 0.1 s, refusing proxy client" in caplog.text
-        assert len(gateway.radio.config_requests()) == 1  # Home Assistant's own, never one for the client
-    finally:
-        await gateway.proxy.stop()
-        await gateway.interface.stop()
+    async with asyncio.timeout(2):
+        await clients[2][2]
+    assert clients[2][1].closing
+    assert not clients[0][2].done()
+    assert not clients[1][2].done()
+    assert gateway.cache.waiting == 2
+    for reader, _, task in clients[:2]:
+        reader.feed_eof()
+        await task
+    assert gateway.cache.waiting == 0
 
 
 async def test_history_replays_after_completion_with_original_identity(gateway: Gateway) -> None:
@@ -1441,21 +1457,21 @@ async def test_a_cancelled_restart_is_not_checked_and_a_burst_is_checked_once(
 
 
 @pytest.mark.usefixtures("quick_restarts")
-async def test_a_shut_down_gateway_closes_clients_and_refuses_new_ones(
-    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(server, "_SNAPSHOT_WAIT_S", 0.1)
+async def test_a_shut_down_gateway_closes_clients_and_holds_new_ones(gateway: Gateway) -> None:
     reader, _, task = await gateway.bootstrapped()
     send(reader, admin_write(admin_pb2.AdminMessage(shutdown_seconds=0)))
     await wait_until(lambda: gateway.radio.admin_sent("shutdown_seconds") != [])
     gateway.radio.silent = gateway.radio.down = True
     async with asyncio.timeout(2):
         await task
-    reader, writer, refused = gateway.connect()
+    # as on main, where its request went to the radio unanswered, a new client stays connected and is sent nothing
+    reader, writer, held = gateway.connect()
     send(reader, mesh_pb2.ToRadio(want_config_id=CLIENT_NONCE))
-    async with asyncio.timeout(2):
-        await refused
+    await asyncio.sleep(0.3)
+    assert not held.done()
     assert writer.frames() == []
+    reader.feed_eof()
+    await held
     assert gateway.interface.is_running  # Home Assistant keeps trying to reconnect, as it always has
 
 
@@ -1477,7 +1493,7 @@ async def test_a_write_during_a_restart_check_is_checked_after_it(
     monkeypatch.setattr(aio_interface, "_RESTART_PROBE_GRACE_S", 0.02)
     entered, release, calls = asyncio.Event(), asyncio.Event(), []
 
-    async def held_check(timeout_s: float) -> None:
+    async def held_check(_kind: str, timeout_s: float) -> None:
         calls.append(timeout_s)
         entered.set()
         await release.wait()
@@ -1592,6 +1608,8 @@ async def test_cancelling_a_later_reboot_keeps_an_earlier_shutdowns_check(
 @pytest.fixture
 def quick_edits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(aio_interface, "_EDIT_IDLE_S", 0.3)
+    # the fixture radio runs 2.8.2, which expires transactions itself; these play one that does not
+    monkeypatch.setattr(aio_interface, "_EDIT_EXPIRY_FIRMWARE", (9, 0, 0))
 
 
 @pytest.mark.usefixtures("quick_restarts", "quick_edits")

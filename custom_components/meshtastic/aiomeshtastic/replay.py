@@ -126,6 +126,10 @@ class ReplayCache:
         self.on_failure: Callable[[], None] | None = None
         self._last_write = float("-inf")
         self._bootstrap_started = 0.0
+        # asks for a download when a client waits and none is under way
+        self.on_wanted: Callable[[], None] | None = None
+        # proxy clients waiting for a snapshot
+        self.waiting = 0
 
     def ingest(self, from_radio: mesh_pb2.FromRadio, requested_config_id: int | None) -> None:
         kind = from_radio.WhichOneof("payload_variant")
@@ -151,6 +155,7 @@ class ReplayCache:
         raw = from_radio.SerializeToString()
         seq = 0
         if kind == "packet":
+            self._note_node_info(from_radio.packet)
             if self._is_incoming_text(from_radio.packet):
                 self._history_seq = seq = self._history_seq + 1
                 self._history.append((seq, raw))
@@ -161,6 +166,47 @@ class ReplayCache:
                     del self._node_state[next(iter(self._node_state))]
         for subscriber in list(self._subscribers):
             subscriber(raw, seq)
+
+    def want(self) -> None:
+        """Note that a client is waiting for a snapshot, so one must be downloaded if none is under way."""
+        if self.snapshot is None and self._pending is None and self.on_wanted is not None:
+            self.on_wanted()
+
+    def _note_node_info(self, packet: mesh_pb2.MeshPacket) -> None:
+        """Keep the snapshot's node list current with a node's details heard live, as the radio's own node DB is."""
+        snapshot = self.snapshot
+        sender = getattr(packet, "from")
+        if (
+            snapshot is None
+            or not packet.HasField("decoded")
+            or packet.decoded.portnum != portnums_pb2.PortNum.NODEINFO_APP
+            or sender in {0, snapshot.my_node_num}
+        ):
+            return
+        try:
+            user = mesh_pb2.User.FromString(packet.decoded.payload)
+        except DecodeError:
+            return
+        records = list(snapshot.records)
+        node_infos = [i for i, (_, other_node) in enumerate(records) if other_node]
+        for i in node_infos:
+            known = mesh_pb2.FromRadio.FromString(records[i][0])
+            if known.node_info.num == sender:
+                known.node_info.user.CopyFrom(user)
+                known.node_info.last_heard = packet.rx_time or known.node_info.last_heard
+                records[i] = (known.SerializeToString(), True)
+                break
+        else:
+            node = mesh_pb2.NodeInfo(num=sender, user=user, last_heard=packet.rx_time, snr=packet.rx_snr)
+            node.channel = packet.channel
+            # with the other nodes, which firmware sends after the configs and before the file list
+            if node_infos:
+                at = node_infos[-1] + 1
+            else:
+                kinds = [mesh_pb2.FromRadio.FromString(raw).WhichOneof("payload_variant") for raw, _ in records]
+                at = kinds.index("fileInfo") if "fileInfo" in kinds else len(records)
+            records.insert(at, (mesh_pb2.FromRadio(node_info=node).SerializeToString(), True))
+        self.snapshot = Snapshot(snapshot.generation, snapshot.my_node_num, tuple(records))
 
     @property
     def bootstrapping(self) -> bool:
