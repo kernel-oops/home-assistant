@@ -967,17 +967,17 @@ async def test_a_download_that_never_completes_is_retried(gateway: Gateway, monk
     assert len(gateway.radio.config_requests()) == 4  # Home Assistant's own, two cut short, then a whole one
 
 
-async def test_retries_stop_with_an_actionable_warning(
+async def test_retries_that_give_up_serve_the_last_download(
     gateway: Gateway, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(aio_connection, "_REPLAY_REFRESH_DELAYS_S", (0.05, 0.05))
     gateway.radio.broken = 100
     await gateway.interface.send_admin_message(OWN, admin_pb2.AdminMessage(set_owner={"long_name": "x"}), ack=False)
-    await wait_until(lambda: "firmware 2.5 or later" in caplog.text)
-    assert "channels [0, 1, 2, 3, 4, 5, 6]" in caplog.text
+    # rather than hold clients for ever, the last download is served as received, saying what it lacked
+    await wait_until(lambda: "failed a check (channels [0, 1, 2, 3, 4, 5, 6])" in caplog.text)
     await asyncio.sleep(0.2)
     assert len(gateway.radio.config_requests()) == 3  # Home Assistant's own, then one per retry, then none
-    assert not gateway.cache.ready.is_set()
+    assert gateway.cache.ready.is_set()
 
 
 async def test_reconnect_supersedes_a_pending_refresh(gateway: Gateway, monkeypatch: pytest.MonkeyPatch) -> None:

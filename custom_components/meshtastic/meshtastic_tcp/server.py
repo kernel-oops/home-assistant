@@ -125,6 +125,8 @@ class _ProxyClient:
         self._text_seq = 0
         # taken from the queue for a bootstrap and not yet all written; a repeated request takes them over
         self._held: list[tuple[bytes, int]] = []
+        # waiting for a snapshot
+        self._waiting = False
 
     async def run(self) -> None:
         # live traffic from the start, as before, so replies to what it sends before asking for config reach it
@@ -182,10 +184,18 @@ class _ProxyClient:
             self.closed.set()
             return
         try:
+            # kept while it waits too: replies to what it sent meanwhile must follow its bootstrap
             self._queue.put_nowait((from_radio, seq))
         except asyncio.QueueFull:
             if not self.closed.is_set():
-                _LOGGER.warning("Proxy client %s is not keeping up, disconnecting it", self._peer_name)
+                if self._waiting:
+                    _LOGGER.warning(
+                        "Proxy client %s waited for the gateway's configuration through %d frames, disconnecting it",
+                        self._peer_name,
+                        _CLIENT_QUEUE_SIZE,
+                    )
+                else:
+                    _LOGGER.warning("Proxy client %s is not keeping up, disconnecting it", self._peer_name)
                 self.closed.set()
 
     async def _stream(self, nonce: int | None) -> None:
@@ -212,8 +222,9 @@ class _ProxyClient:
 
     async def _bootstrap(self, nonce: int) -> bool:
         # never ask the radio for the client: that would restart Home Assistant's own session. It waits instead,
-        # receiving live traffic, until Home Assistant's download completes; one is started if none is under way.
-        # The wait ends with the radio session, which disconnects it, or when its queue overflows
+        # until Home Assistant's download completes; one is started if none is under way. It is sent nothing
+        # meanwhile, and what arrives is queued for after its bootstrap. The wait ends with the radio session, or
+        # once more arrives than its queue holds
         if (bound := self._cache.bind(self._on_record, self._text_seq)) is None:
             if self._cache.waiting >= _MAX_WAITING:
                 _LOGGER.warning(
@@ -223,12 +234,14 @@ class _ProxyClient:
                 return False
             _LOGGER.info("Proxy client %s waits for the gateway's configuration download", self._peer_name)
             self._cache.waiting += 1
+            self._waiting = True
             try:
                 while (bound := self._cache.bind(self._on_record, self._text_seq)) is None:
                     self._cache.want()
                     await self._cache.ready.wait()
             finally:
                 self._cache.waiting -= 1
+                self._waiting = False
 
         # what was already queued for this client arrived before binding: its texts are merged with the history,
         # which may no longer hold the oldest of them, and the rest follows; later arrivals stay queued

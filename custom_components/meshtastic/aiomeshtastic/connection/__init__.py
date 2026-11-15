@@ -97,6 +97,7 @@ class ClientApiConnection:
         self._reconnect_status_lock = asyncio.Lock()
 
     async def connect(self) -> None:
+        self._replay_gave_up = False
         try:
             await self._connect()
         except ClientApiConnectionError:
@@ -517,6 +518,8 @@ class ClientApiConnection:
             if self.replay_cache.ready.is_set():
                 return
         self._replay_gave_up = True
+        if self.replay_cache.accept_last_download():
+            return
         self._logger.warning(
             "TCP proxy clients cannot connect until Home Assistant next reconnects to the gateway: its configuration "
             "could not be read (%s). The proxy needs firmware 2.5 or later",
@@ -619,8 +622,6 @@ class ClientApiConnection:
         If reconnect is already in progress, waits until pending reconnect is completed.
         Returns true if new reconnect has been performed
         """
-        self.cancel_replay_refresh()  # a reconnect downloads the configuration itself
-        self._replay_gave_up = False
         async with self._reconnect_status_lock:
             reconnect_was_in_progress = self._reconnect_in_progress.is_set()
 
@@ -643,6 +644,8 @@ class ClientApiConnection:
             return False
 
         self._logger.debug("Reconnect started")
+        self.cancel_replay_refresh()  # a reconnect downloads the configuration itself
+        self._replay_gave_up = False
         try:
             async with self._reconnect_lock:
                 if self.is_connected or force:

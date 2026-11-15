@@ -33,6 +33,8 @@ HISTORY_SIZE = 256
 NODE_STATE_SIZE = 2048
 _NODE_STATE_PORTS = {portnums_pb2.PortNum.POSITION_APP, portnums_pb2.PortNum.NODE_STATUS_APP}
 _NODE_STATE_TELEMETRY = {"device_metrics", "environment_metrics"}
+# nodes first heard live are added to the snapshot up to this many, above any firmware's node DB
+_MAX_NODES = 500
 
 # what the firmware may interleave with a bootstrap without it being part of the node's state
 _NOT_STATE = frozenset({
@@ -130,6 +132,8 @@ class ReplayCache:
         self.on_wanted: Callable[[], None] | None = None
         # proxy clients waiting for a snapshot
         self.waiting = 0
+        # the records and identity of the last download of ours the checks rejected, until something newer
+        self._rejected: tuple[list[tuple[bytes, bool | None]], tuple] | None = None
 
     def ingest(self, from_radio: mesh_pb2.FromRadio, requested_config_id: int | None) -> None:
         kind = from_radio.WhichOneof("payload_variant")
@@ -192,11 +196,16 @@ class ReplayCache:
         for i in node_infos:
             known = mesh_pb2.FromRadio.FromString(records[i][0])
             if known.node_info.num == sender:
+                stored_key = known.node_info.user.public_key
+                if stored_key and user.public_key != stored_key:
+                    return  # firmware keeps a node's key, and so its name, against a different or missing one
                 known.node_info.user.CopyFrom(user)
                 known.node_info.last_heard = packet.rx_time or known.node_info.last_heard
                 records[i] = (known.SerializeToString(), True)
                 break
         else:
+            if len(node_infos) >= _MAX_NODES:
+                return
             node = mesh_pb2.NodeInfo(num=sender, user=user, last_heard=packet.rx_time, snr=packet.rx_snr)
             node.channel = packet.channel
             # with the other nodes, which firmware sends after the configs and before the file list
@@ -257,6 +266,7 @@ class ReplayCache:
     def stale(self, reason: str) -> None:
         """Forget the snapshot and any bootstrap in progress; bound clients stay on the session they joined."""
         self._pending = None
+        self._rejected = None
         if self.snapshot is not None:
             self._logger.debug("Bootstrap snapshot %d no longer current: %s", self.snapshot.generation, reason)
         self.snapshot = None
@@ -334,12 +344,28 @@ class ReplayCache:
             self._failed("the gateway was changed as the download began")
             return
 
-        result = _read_bootstrap(pending)
-        if isinstance(result, str):
-            self._failed(result)
+        records, identity, problem = _read_bootstrap(pending)
+        if problem is not None:
+            # kept in case every download fails the same way, as on firmware this check does not know
+            self._rejected = (records, identity)
+            self._failed(problem)
             return
-        records, identity = result
+        self._commit(records, identity)
 
+    def accept_last_download(self) -> bool:
+        """Serve the last download the checks rejected, once retries have given up; True if there was one."""
+        if self.snapshot is not None or self._rejected is None:
+            return False
+        self._logger.warning(
+            "Serving proxy clients the gateway's configuration as received, though it failed a check (%s)",
+            self.failure,
+        )
+        self._commit(*self._rejected)
+        return True
+
+    def _commit(self, records: list[tuple[bytes, bool | None]], identity: tuple) -> None:
+        assert self.my_node_num is not None  # noqa: S101  # set by the download's my_info
+        self._rejected = None
         if self._identity is not None and identity != self._identity:
             # what was received under another node identity, channel or key must not replay under the new one
             self._logger.info("Gateway identity, channels or keys changed, clearing %d texts", len(self._history))
@@ -356,8 +382,10 @@ def _sender(raw: bytes) -> int:
     return getattr(mesh_pb2.FromRadio.FromString(raw).packet, "from")
 
 
-def _read_bootstrap(pending: list[tuple[str, bytes]]) -> tuple[list[tuple[bytes, bool | None]], tuple] | str:
-    """Check a received bootstrap against firmware's order and contents; the records and identity, or why not."""
+def _read_bootstrap(
+    pending: list[tuple[str, bytes]],
+) -> tuple[list[tuple[bytes, bool | None]], tuple, str | None]:
+    """Read a received bootstrap: its records, identity, and what it lacks of a complete one, if anything."""
     parsed = [(kind, raw, mesh_pb2.FromRadio.FromString(raw)) for kind, raw in pending]
     my_info = parsed[0][2].my_info
     records: list[tuple[bytes, bool | None]] = []
@@ -365,7 +393,7 @@ def _read_bootstrap(pending: list[tuple[str, bytes]]) -> tuple[list[tuple[bytes,
     identity: list[object] = [my_info.my_node_num]
     channels: list[int] = []
     variants: set[str | None] = set()
-    last_phase = -1
+    problem: str | None = None
     for kind, raw, from_radio in parsed:
         other_node = None
         phase_kind = kind
@@ -383,19 +411,19 @@ def _read_bootstrap(pending: list[tuple[str, bytes]]) -> tuple[list[tuple[bytes,
                 identity.append((from_radio.config.security.public_key, from_radio.config.security.private_key))
         phase = _PHASE.get(phase_kind)
         if phase is not None:
-            if phase < last_phase or (phase_kind == "own_node_info" and phase_kind in phases):
-                return f"{kind} out of firmware order"
-            last_phase = phase
+            # order is not checked: records are replayed as received, and a new my_info restarts the download
+            if phase_kind == "own_node_info" and phase_kind in phases:
+                problem = problem or "the gateway's own node twice"
             phases.append(phase_kind)
         records.append((raw, other_node))
     if missing := _REQUIRED.difference(phases):
-        return f"no {', '.join(sorted(missing))}"
+        problem = problem or f"no {', '.join(sorted(missing))}"
     if channels != list(range(_CHANNELS)):
         # firmware sends every channel slot in index order; fewer, or zeroed ones, mean a broken bootstrap
-        return f"channels {channels}"
+        problem = problem or f"channels {channels}"
     if missing := (_CONFIGS | _MODULE_CONFIGS).difference(variants):
-        return f"no {', '.join(sorted(missing))} config"
+        problem = problem or f"no {', '.join(sorted(missing))} config"
     if my_info.nodedb_count > 1 and "node_info" not in phases:
         # the node count can change during a download, so only a wholly missing node list is detectable
-        return "no other nodes"
-    return records, tuple(identity)
+        problem = problem or "no other nodes"
+    return records, tuple(identity), problem

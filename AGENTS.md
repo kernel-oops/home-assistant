@@ -75,7 +75,8 @@ coordinator.py the node database as coordinator data, keyed by node number
   reconnect and `rebooted`), so any new path that opens a session must invalidate before its first record;
   closing clients there is deliberate. A client asking for config with no snapshot is held, never refused or
   forwarded, until one completes (`ReplayCache.want` starts a download; `server._MAX_WAITING` bounds them).
-  Live `NODEINFO_APP` updates the snapshot's node list.
+  Live `NODEINFO_APP` updates the snapshot's node list, keeping a known key as firmware does. Once retries
+  give up, `accept_last_download` serves the last rejected download as received rather than hold clients for ever.
   The cache belongs to the `ClientApiConnection` and is fed as packets are read, so it sees every packet,
   including a reconnect's bootstrap that only `request_config()` reads. Other clients' writes go through
   `connection.forward()` and Home Assistant's own through `send_packet()`; both call `note_write()` before and

@@ -450,12 +450,13 @@ API connection to itself.
   configuration into the next; they reconnect and are served again once Home Assistant's next download
   completes. A setting change, by Home Assistant, the bundled web client or an app through the proxy, leaves
   connected apps connected; Home Assistant downloads the configuration again a few seconds after the last
-  write. An app that asks for its configuration while there is no usable download stays connected, receiving
-  live traffic, and is answered as soon as one completes; Home Assistant starts one if none is under way. A
-  download it could not use is retried for a while before giving up until the next reconnect, and apps keep
-  waiting meanwhile, up to 16 at once. Connecting the bundled web client starts a new download too. Changes
+  write. An app that asks for its configuration while there is no usable download stays connected, is sent
+  nothing meanwhile, and is answered as soon as one completes, followed by what arrived meanwhile; Home
+  Assistant starts one if none is under way. A
+  download it could not use is retried for a while; if every one fails, apps are served the last one as
+  received. Up to 16 apps wait at once. Connecting the bundled web client starts a new download too. Changes
   made to the radio by other means, for example over Bluetooth, are not seen until the next download. The
-  proxy needs firmware 2.5 or later.
+  proxy is tested with firmware 2.5 or later.
 - **What reaches the radio.** Everything an app sends is passed to the radio as sent, as before: messages and
   other mesh packets, admin for the gateway or other nodes (settings, owner, channels, favourite, ignored and
   deleted nodes, reboot and reset), file transfers and MQTT proxy messages. Only a configuration request,

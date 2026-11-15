@@ -57,7 +57,7 @@ def without(records: list, kind: str) -> list:
         pytest.param(without(bootstrap(NONCE), "moduleConfig"), NONCE, id="no module config"),
         pytest.param(bootstrap(NONCE)[1:], NONCE, id="no my_info"),
         pytest.param(bootstrap(NONCE)[:8] + bootstrap(NONCE)[:-1][-200:] + [bootstrap(NONCE)[-1]], NONCE, id="gap"),
-        pytest.param([*bootstrap(NONCE)[:3], channel(0, "x"), *bootstrap(NONCE)[3:]], NONCE, id="out of order"),
+        pytest.param([*bootstrap(NONCE)[:3], channel(0, "x"), *bootstrap(NONCE)[3:]], NONCE, id="a channel twice"),
         pytest.param([r for r in bootstrap(NONCE) if r.channel.index != 7], NONCE, id="a channel missing"),
         pytest.param([r for r in bootstrap(NONCE) if not r.config.HasField("lora")], NONCE, id="a config missing"),
         pytest.param(
@@ -413,3 +413,41 @@ def test_a_client_waiting_asks_for_a_download_only_when_none_is_under_way() -> N
     cache.ingest(bootstrap(NONCE)[0], NONCE)  # a download under way
     cache.want()
     assert asked == [True]
+
+
+def test_a_known_key_is_kept_as_firmware_keeps_it() -> None:
+    cache = committed()
+    known = next(num for num in snapshot_nodes(cache) if num != OWN)
+    before = snapshot_nodes(cache)
+    keyed = nodeinfo(known, "with a key")
+    user = mesh_pb2.User.FromString(keyed.packet.decoded.payload)
+    user.public_key = b"a" * 32
+    keyed.packet.decoded.payload = user.SerializeToString()
+    cache.ingest(keyed, NONCE)
+    assert snapshot_nodes(cache)[known] == "with a key"
+    for public_key in (b"b" * 32, b""):
+        user.public_key = public_key
+        user.long_name = "spoofed"
+        keyed.packet.decoded.payload = user.SerializeToString()
+        cache.ingest(keyed, NONCE)
+    assert snapshot_nodes(cache) == {**before, known: "with a key"}
+
+
+def test_new_nodes_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = committed()
+    count = len(snapshot_nodes(cache))
+    monkeypatch.setattr(replay, "_MAX_NODES", count - 1)  # every other node, not the gateway itself
+    cache.ingest(nodeinfo(0x7E57, "one too many"), NONCE)
+    assert 0x7E57 not in snapshot_nodes(cache)
+
+
+def test_a_download_every_check_rejects_is_served_once_retries_give_up() -> None:
+    cache = ReplayCache()
+    for record in without(bootstrap(NONCE), "moduleConfig"):  # as firmware this code does not know
+        cache.ingest(record, NONCE)
+    assert cache.snapshot is None
+    assert cache.accept_last_download()
+    assert cache.snapshot is not None
+    assert not cache.accept_last_download()  # only while there is no snapshot
+    cache.stale("a write")
+    assert not cache.accept_last_download()  # nor once something newer has superseded it
