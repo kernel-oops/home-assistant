@@ -521,8 +521,8 @@ class ClientApiConnection:
         if self.replay_cache.accept_last_download():
             return
         self._logger.warning(
-            "TCP proxy clients cannot connect until Home Assistant next reconnects to the gateway: its configuration "
-            "could not be read (%s). The proxy needs firmware 2.5 or later",
+            "TCP proxy clients wait until Home Assistant next reconnects to the gateway: no complete configuration "
+            "download was received (%s)",
             self.replay_cache.failure or "no complete download",
         )
 

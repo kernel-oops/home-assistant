@@ -33,7 +33,7 @@ HISTORY_SIZE = 256
 NODE_STATE_SIZE = 2048
 _NODE_STATE_PORTS = {portnums_pb2.PortNum.POSITION_APP, portnums_pb2.PortNum.NODE_STATUS_APP}
 _NODE_STATE_TELEMETRY = {"device_metrics", "environment_metrics"}
-# nodes first heard live are added to the snapshot up to this many, above any firmware's node DB
+# nodes first heard live are added to the snapshot up to this many, a bound on its growth
 _MAX_NODES = 500
 
 # what the firmware may interleave with a bootstrap without it being part of the node's state
