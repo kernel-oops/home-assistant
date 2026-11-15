@@ -200,7 +200,8 @@ async def test_two_tabs_in_one_browser_keep_their_own_sessions(
         yield mesh_pb2.FromRadio()
 
     fake_client._interface = SimpleNamespace(  # type: ignore[attr-defined]
-        _connection=SimpleNamespace(forward=AsyncMock()), from_radio_stream=from_radio_stream
+        _connection=SimpleNamespace(forward=AsyncMock(), config_requested=lambda *_, **__: None),
+        from_radio_stream=from_radio_stream,
     )
     _, gateway = await setup_gateway(hass)
     paths = [

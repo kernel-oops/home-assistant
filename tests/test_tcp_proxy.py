@@ -1274,7 +1274,11 @@ def set_owner_write() -> mesh_pb2.ToRadio:
 
 def web_view(gateway: Gateway) -> meshtastic_web.MeshtasticWebApiV1ToRadioView:
     view = meshtastic_web.MeshtasticWebApiV1ToRadioView(None, FakeWebContext(gateway.radio), None)
-    view._check_access = lambda *_: None
+
+    async def allowed(*_: object) -> None:
+        return None
+
+    view._check_access = allowed  # type: ignore[method-assign]
     return view
 
 
