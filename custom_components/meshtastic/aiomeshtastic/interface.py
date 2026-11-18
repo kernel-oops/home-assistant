@@ -58,6 +58,7 @@ from .protobuf import (
     telemetry_pb2,
 )
 from .protobuf.mesh_pb2 import MeshPacket
+from .replay import ReplayCache
 
 # nanopb limits on MqttClientProxyMessage (mesh.options); firmware cannot decode anything larger.
 # A string's max_size counts its terminating NUL, so the 60 byte topic field holds 59 bytes of text.
@@ -476,6 +477,10 @@ class MeshInterface:
         self._is_running.clear()
         self._connected_node_ready.clear()
         self._is_stopped.set()
+        # no download may commit after this: a refresh or bootstrap still arriving no longer matches
+        self._connection.cancel_replay_refresh()
+        self._connection.requested_config_id = None
+        self.replay_cache.invalidate("gateway connection stopped")
 
         # the reboot handler calls stop() from a background task; cancelling it here would skip the start() after
         self._background_tasks.discard(asyncio.current_task())
@@ -523,6 +528,10 @@ class MeshInterface:
         with contextlib.suppress(asyncio.CancelledError):
             t.cancel()
             await t
+
+    @property
+    def replay_cache(self) -> ReplayCache:
+        return self._connection.replay_cache
 
     @property
     def is_running(self) -> bool:
@@ -823,7 +832,7 @@ class MeshInterface:
         elif packet.HasField("metadata"):
             self._connected_node_metadata = packet.metadata
         elif packet.HasField("channel"):
-            # replace by index: a bootstrap requested by another party (e.g. a TCP proxy client) resends all channels
+            # replace by index: a bootstrap requested by another party (e.g. the web client) resends all channels
             channels = self._connected_node_channels
             assert channels is not None  # noqa: S101  # enumerate(None) would raise
             for i, existing in enumerate(channels):
@@ -1039,6 +1048,7 @@ class MeshInterface:
                     await self._reconnect_while_running()
 
     async def _reconnect_while_running(self, *, force: bool = False) -> None:  # noqa: PLR0912, PLR0915
+        self.replay_cache.invalidate("reconnecting to gateway")
         force_reconnect = force
         reconnect_counter_max = 6
         reconnect_counter = -1

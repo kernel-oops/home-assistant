@@ -19,6 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry, async_
 
 from custom_components.meshtastic.aiomeshtastic import interface as interface_module
 from custom_components.meshtastic.aiomeshtastic.interface import ConnectionState, MeshInterface
+from custom_components.meshtastic.aiomeshtastic.replay import ReplayCache
 from custom_components.meshtastic.const import CONF_OPTION_FILTER_NODES
 from custom_components.meshtastic.coordinator import GATEWAY_LINK_GRACE_PERIOD, MeshtasticDataUpdateCoordinator
 from custom_components.meshtastic.entity import MeshtasticNodeEntity
@@ -30,6 +31,7 @@ class FakeConnection:
     def __init__(self, *, reconnect_failures: int = 0) -> None:
         self.reconnect_failures = reconnect_failures
         self.reconnect_calls = 0
+        self.replay_cache = ReplayCache()
 
     async def reconnect(self, *, force: bool = False) -> bool:  # noqa: ARG002
         self.reconnect_calls += 1

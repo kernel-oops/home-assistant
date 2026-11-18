@@ -63,6 +63,7 @@ class StreamingClientTransport(ClientApiConnection):
         packet_len = (header[2] << 8) + header[3]
         if packet_len > StreamingClientTransport.MAX_TO_FROM_RADIO_SIZE:
             # corrupted packet
+            self.replay_cache.frame_lost()
             await self._on_other_data(header)
             return None
 
@@ -86,6 +87,7 @@ class StreamingClientTransport(ClientApiConnection):
                         yield from_radio
                     except message.DecodeError:
                         self._logger.warning("Error while parsing FromRadio bytes %s", packet, exc_info=True)
+                        self.replay_cache.frame_lost()
         except asyncio.exceptions.IncompleteReadError as e:
             raise ClientApiConnectionInterruptedError from e
 
@@ -104,11 +106,13 @@ class StreamingClientTransport(ClientApiConnection):
     async def _read_header(self) -> bytes | None:
         header = cast("bytes", await self._read_bytes(exactly=1))  # exact reads return bytes or raise
         if header[0] != StreamingClientTransport.START1:
+            self.replay_cache.frame_lost()  # unframed bytes in a bootstrap may be a damaged record
             await self._on_other_data(header)
             return None
 
         header += cast("bytes", await self._read_bytes(exactly=1))
         if header[1] != StreamingClientTransport.START2:
+            self.replay_cache.frame_lost()  # unframed bytes in a bootstrap may be a damaged record
             await self._on_other_data(header)
             return None
 
