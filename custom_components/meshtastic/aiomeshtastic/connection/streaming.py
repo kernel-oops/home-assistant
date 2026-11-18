@@ -108,12 +108,14 @@ class StreamingClientTransport(ClientApiConnection):
         if header[0] != StreamingClientTransport.START1:
             self.replay_cache.frame_lost()  # unframed bytes in a bootstrap may be a damaged record
             await self._on_other_data(header)
+            await asyncio.sleep(0)  # a buffered burst of garbage would otherwise hold the event loop until it ends
             return None
 
         header += cast("bytes", await self._read_bytes(exactly=1))
         if header[1] != StreamingClientTransport.START2:
             self.replay_cache.frame_lost()  # unframed bytes in a bootstrap may be a damaged record
             await self._on_other_data(header)
+            await asyncio.sleep(0)
             return None
 
         header += cast("bytes", await self._read_bytes(exactly=2))

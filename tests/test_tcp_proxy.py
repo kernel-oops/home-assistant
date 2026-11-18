@@ -1731,3 +1731,28 @@ async def test_a_web_client_download_begun_as_a_write_lands_is_not_kept(
     await wait_until(lambda: len(gateway.radio.config_requests()) == 3 and gateway.cache.ready.is_set())
     assert gateway.interface.is_running
     assert gateway.interface._connected_node_ready.is_set()
+
+
+async def test_a_burst_of_garbage_bytes_lets_the_event_loop_run() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"A" * 1000)  # never a frame start, all buffered at once
+    reader.feed_eof()
+    connection = server.ClientProxyTransport(reader, FakeWriter())
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0)
+            ticks += 1
+
+    async def read_all() -> None:
+        while True:
+            await connection.read_to_radio_packet()
+
+    ticker = asyncio.create_task(tick())
+    with pytest.raises(asyncio.IncompleteReadError):
+        await read_all()
+    ticker.cancel()
+    # before, the whole burst was rejected byte by byte without the loop getting a single turn
+    assert ticks >= 500
